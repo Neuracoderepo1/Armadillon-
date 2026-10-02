@@ -52,8 +52,25 @@ go run ./cmd/gateway
 
 ## Status
 
-Early-stage MVP: core pipeline, risk engine, circuit breaker, and
-reservation/reconciliation flow are implemented and covered by unit and
-integration tests. Postgres store, HTTP API surface, and pricing/provider
-registries exist but should be treated as scaffolding pending production
-hardening (auth, observability, real provider adapters).
+Core pipeline, risk engine, and circuit breaker are implemented and
+covered by unit and integration tests. The HTTP API enforces API key
+scopes, has a secured kill switch and upstream proxy, per-IP/per-tenant
+rate limiting, and request timeouts; CI runs the full suite with
+`-race` against a live Postgres service container.
+
+**Reservation durability — in progress.** The reservation state machine
+has been corrected: a reservation whose TTL expires now moves to
+`UNKNOWN` rather than silently returning budget (see
+`internal/reservation/reservation.go`'s `State` doc comment) — only an
+explicit, audited resolution (`ResolveUnknownReleased` /
+`ResolveUnknownReconciled`), never a bare timeout, can determine what
+actually happened. The matching durable schema is in
+`migrations/0002_financial_control.sql` (verified against a real
+Postgres 16 instance, including that the CHECK constraints reject
+invalid state/column combinations). **Not yet done:** reservations
+still live only in an in-memory map (`internal/reservation`) — the
+Postgres-backed repository that makes this durable across restarts,
+the OpenAI-specific usage-parsing adapter, the recovery worker that
+resolves `UNKNOWN` reservations, and admin HTTP routes are still
+queued. `internal/provider` (GenericHTTP forwarding, SSRF allowlist)
+still has no test coverage.

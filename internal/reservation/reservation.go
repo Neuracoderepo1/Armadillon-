@@ -14,13 +14,35 @@ import (
 	"velocityguard/internal/money"
 )
 
+// State is a reservation's position in its financial lifecycle.
+//
+// RESERVED  -- Reconcile(actual) --> RECONCILED   (definite: usage was reported)
+// RESERVED  -- Release() before dispatch --> RELEASED   (definite: never sent upstream)
+// RESERVED  -- TTL expiry (ExpireStale) --> UNKNOWN      (ambiguous: no reconciliation arrived in time)
+// UNKNOWN   -- ResolveUnknownReleased() --> RELEASED   (recovery worker confirmed: never billed)
+// UNKNOWN   -- ResolveUnknownReconciled(actual) --> RECONCILED (recovery worker confirmed: was billed, here's the cost)
+//
+// The critical safety rule (do not violate this): TTL expiry alone must
+// NEVER return budget to the tenant. Once a reservation may have been
+// dispatched to an upstream provider, a bare timeout does not tell us
+// whether the call executed and was billed — only that reconciliation
+// didn't arrive in time. Treating that ambiguity as "definitely not
+// billed" (the old EXPIRED behavior) can let a tenant's budget silently
+// refill while real spend is still outstanding upstream, defeating the
+// entire purpose of reservations. UNKNOWN keeps the amount held
+// (still counted in `reserved`, not returned to `available`) until a
+// recovery worker resolves it by an out-of-band check (e.g. querying the
+// provider for the actual outcome) — never by TTL alone.
 type State string
 
 const (
 	StateReserved   State = "RESERVED"
 	StateReconciled State = "RECONCILED"
 	StateReleased   State = "RELEASED"
-	StateExpired    State = "EXPIRED"
+	// StateUnknown replaces the old StateExpired. See the State doc
+	// comment above for why TTL expiry must land here, not on a state
+	// that returns budget.
+	StateUnknown State = "UNKNOWN"
 )
 
 var (
@@ -260,9 +282,12 @@ func computeReconcileResult(reserved, actual money.Micros) ReconcileResult {
 	return res
 }
 
-// ExpireStale releases any RESERVED reservation whose TTL has passed and
-// was never reconciled (e.g. the provider call hung and reconciliation
-// never arrived). This bounds the "hostage" budget from crashed requests.
+// ExpireStale marks any RESERVED reservation whose TTL has passed as
+// UNKNOWN — it does NOT return budget (see the State doc comment: TTL
+// alone is not proof the upstream call never executed/was never billed).
+// The amount stays held in `reserved` until a recovery worker calls
+// ResolveUnknownReleased or ResolveUnknownReconciled based on an
+// out-of-band check of what actually happened upstream.
 func (m *Manager) ExpireStale() int {
 	now := m.now()
 	m.mu.Lock()
@@ -278,12 +303,78 @@ func (m *Manager) ExpireStale() int {
 		acc := m.getAccount(r.TenantID)
 		acc.mu.Lock()
 		if r.State == StateReserved { // re-check under lock
-			acc.reserved -= r.Amount
-			r.State = StateExpired
+			// Deliberately no acc.reserved change: the amount stays
+			// held. This is the fix for the critical safety flaw where
+			// TTL expiry silently returned budget for a reservation that
+			// may already have been dispatched and billed upstream.
+			r.State = StateUnknown
 		}
 		acc.mu.Unlock()
 	}
 	return len(stale)
+}
+
+// ResolveUnknownReleased is called by a recovery worker once it has
+// confirmed, out-of-band, that an UNKNOWN reservation's request never
+// actually executed upstream (e.g. the provider has no record of it) —
+// so it's now safe to return the held budget. This is the ONLY path by
+// which an UNKNOWN reservation returns budget; TTL alone can never do
+// this (see ExpireStale).
+func (m *Manager) ResolveUnknownReleased(reservationID string) error {
+	m.mu.Lock()
+	r, ok := m.reservations[reservationID]
+	m.mu.Unlock()
+	if !ok {
+		return ErrNotFound
+	}
+
+	acc := m.getAccount(r.TenantID)
+	acc.mu.Lock()
+	defer acc.mu.Unlock()
+
+	if r.State == StateReleased {
+		return nil // already resolved this way; idempotent
+	}
+	if r.State != StateUnknown {
+		return ErrTerminalState
+	}
+	acc.reserved -= r.Amount
+	r.State = StateReleased
+	return nil
+}
+
+// ResolveUnknownReconciled is called by a recovery worker once it has
+// confirmed, out-of-band, that an UNKNOWN reservation's request DID
+// execute upstream and billed actualCost — so it's now safe to move the
+// held amount from `reserved` to `settled` at the confirmed real cost,
+// exactly as a normal Reconcile would have done if it had arrived in time.
+func (m *Manager) ResolveUnknownReconciled(reservationID string, actualCost money.Micros) (ReconcileResult, error) {
+	m.mu.Lock()
+	r, ok := m.reservations[reservationID]
+	m.mu.Unlock()
+	if !ok {
+		return ReconcileResult{}, ErrNotFound
+	}
+
+	acc := m.getAccount(r.TenantID)
+	acc.mu.Lock()
+	defer acc.mu.Unlock()
+
+	if r.Reconciled {
+		return computeReconcileResult(r.Amount, r.ActualCost), nil // idempotent
+	}
+	if r.State != StateUnknown {
+		return ReconcileResult{}, ErrTerminalState
+	}
+
+	acc.reserved -= r.Amount
+	acc.settled += actualCost
+
+	r.ActualCost = actualCost
+	r.Reconciled = true
+	r.State = StateReconciled
+
+	return computeReconcileResult(r.Amount, actualCost), nil
 }
 
 func (m *Manager) Get(reservationID string) (*Reservation, error) {

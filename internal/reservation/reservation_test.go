@@ -173,8 +173,11 @@ func TestRelease_ReturnsbudgetAndIsIdempotent(t *testing.T) {
 	}
 }
 
-// Reservation expiry: a crashed/hung request must not hold budget hostage forever.
-func TestExpireStale_ReturnsBudget(t *testing.T) {
+// Reservation expiry: a crashed/hung request must not hold budget hostage
+// forever, BUT (the critical safety fix) TTL alone must never return
+// budget either — see the State doc comment in reservation.go. Expiry
+// moves the reservation to UNKNOWN and the amount stays held.
+func TestExpireStale_MovesToUnknown_DoesNotReturnBudget(t *testing.T) {
 	m := NewManager()
 	m.SetBudget("t1", money.FromFloat(10))
 	fixed := time.Now()
@@ -184,22 +187,110 @@ func TestExpireStale_ReturnsBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = r
 
 	// Advance the clock past expiry.
 	m.now = func() time.Time { return fixed.Add(2 * time.Second) }
 	n := m.ExpireStale()
 	if n != 1 {
-		t.Fatalf("expected 1 reservation expired, got %d", n)
+		t.Fatalf("expected 1 reservation to move to UNKNOWN, got %d", n)
 	}
+
+	// The $4 must still be held — NOT returned — because we don't know
+	// whether the upstream call executed and was billed.
 	exp := m.Exposure("t1")
-	if exp.Available != money.FromFloat(10) {
-		t.Fatalf("expected budget fully returned after expiry, got %s", exp.Available)
+	if exp.Available != money.FromFloat(6) {
+		t.Fatalf("expected $4 to remain held (available=$6) after expiry to UNKNOWN, got available=%s", exp.Available)
+	}
+	if exp.Reserved != money.FromFloat(4) {
+		t.Fatalf("expected $4 still counted as reserved, got %s", exp.Reserved)
 	}
 
 	rec, _ := m.Get(r.ID)
-	if rec.State != StateExpired {
-		t.Fatalf("expected state EXPIRED, got %s", rec.State)
+	if rec.State != StateUnknown {
+		t.Fatalf("expected state UNKNOWN, got %s", rec.State)
+	}
+}
+
+// TestResolveUnknownReleased_ReturnsBudget proves the ONLY way an
+// UNKNOWN reservation's budget comes back is an explicit recovery-worker
+// call confirming the request never actually executed upstream.
+func TestResolveUnknownReleased_ReturnsBudget(t *testing.T) {
+	m := NewManager()
+	m.SetBudget("t1", money.FromFloat(10))
+	fixed := time.Now()
+	m.now = func() time.Time { return fixed }
+
+	r, _ := m.Reserve("t1", money.FromFloat(4), time.Second)
+	m.now = func() time.Time { return fixed.Add(2 * time.Second) }
+	m.ExpireStale()
+
+	if err := m.ResolveUnknownReleased(r.ID); err != nil {
+		t.Fatalf("ResolveUnknownReleased: %v", err)
+	}
+	exp := m.Exposure("t1")
+	if exp.Available != money.FromFloat(10) {
+		t.Fatalf("expected budget fully returned after confirmed non-execution, got %s", exp.Available)
+	}
+	rec, _ := m.Get(r.ID)
+	if rec.State != StateReleased {
+		t.Fatalf("expected state RELEASED, got %s", rec.State)
+	}
+
+	// Idempotent: calling it again must not double-release or error oddly.
+	if err := m.ResolveUnknownReleased(r.ID); err != nil {
+		t.Fatalf("second ResolveUnknownReleased should be idempotent, got %v", err)
+	}
+	if exp2 := m.Exposure("t1"); exp2.Available != money.FromFloat(10) {
+		t.Fatalf("expected no double-release, available=%s", exp2.Available)
+	}
+
+	// Cannot resolve a reservation that was never in UNKNOWN.
+	r2, _ := m.Reserve("t1", money.FromFloat(1), time.Minute)
+	if err := m.ResolveUnknownReleased(r2.ID); err != ErrTerminalState {
+		t.Fatalf("expected ErrTerminalState resolving a still-RESERVED reservation, got %v", err)
+	}
+}
+
+// TestResolveUnknownReconciled_SettlesActualCost proves the other
+// recovery outcome: the recovery worker confirms the call DID execute
+// and was billed, so the held amount settles at the real cost — exactly
+// like a normal Reconcile would have, had it arrived before the TTL.
+func TestResolveUnknownReconciled_SettlesActualCost(t *testing.T) {
+	m := NewManager()
+	m.SetBudget("t1", money.FromFloat(10))
+	fixed := time.Now()
+	m.now = func() time.Time { return fixed }
+
+	r, _ := m.Reserve("t1", money.FromFloat(4), time.Second)
+	m.now = func() time.Time { return fixed.Add(2 * time.Second) }
+	m.ExpireStale()
+
+	res, err := m.ResolveUnknownReconciled(r.ID, money.FromFloat(3.50))
+	if err != nil {
+		t.Fatalf("ResolveUnknownReconciled: %v", err)
+	}
+	if res.Released != money.FromFloat(0.50) {
+		t.Fatalf("expected $0.50 released (reserved $4 - actual $3.50), got %s", res.Released)
+	}
+	exp := m.Exposure("t1")
+	if exp.Settled != money.FromFloat(3.50) {
+		t.Fatalf("expected $3.50 settled, got %s", exp.Settled)
+	}
+	if exp.Available != money.FromFloat(6.50) {
+		t.Fatalf("expected $6.50 available ($10 - $3.50 settled), got %s", exp.Available)
+	}
+	rec, _ := m.Get(r.ID)
+	if rec.State != StateReconciled {
+		t.Fatalf("expected state RECONCILED, got %s", rec.State)
+	}
+
+	// Idempotent.
+	res2, err := m.ResolveUnknownReconciled(r.ID, money.FromFloat(999))
+	if err != nil {
+		t.Fatalf("second ResolveUnknownReconciled should be idempotent, got %v", err)
+	}
+	if res2.Actual != money.FromFloat(3.50) {
+		t.Fatalf("expected idempotent call to return the original actual cost, got %s", res2.Actual)
 	}
 }
 
