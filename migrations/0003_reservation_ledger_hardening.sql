@@ -52,7 +52,7 @@ DO $$
 BEGIN
     -- A pending actual only makes sense while the reservation is unresolved,
     -- or (kept for traceability) after reconciliation to that same amount.
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'reservations_pending_shape') THEN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'reservations_pending_shape' AND conrelid = 'reservations'::regclass) THEN
         ALTER TABLE reservations ADD CONSTRAINT reservations_pending_shape CHECK (
             pending_actual_minor_units IS NULL
             OR state IN ('RESERVED', 'UNKNOWN')
@@ -61,14 +61,14 @@ BEGIN
     END IF;
 
     -- Terminal states carry a resolution timestamp; non-terminal ones do not.
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'reservations_resolved_shape') THEN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'reservations_resolved_shape' AND conrelid = 'reservations'::regclass) THEN
         ALTER TABLE reservations ADD CONSTRAINT reservations_resolved_shape CHECK (
             (state IN ('RESERVED', 'UNKNOWN') AND resolved_at IS NULL)
             OR (state IN ('RELEASED', 'RECONCILED') AND resolved_at IS NOT NULL)
         ) NOT VALID;
     END IF;
 
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'reservation_events_states_valid') THEN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'reservation_events_states_valid' AND conrelid = 'reservation_events'::regclass) THEN
         ALTER TABLE reservation_events ADD CONSTRAINT reservation_events_states_valid CHECK (
             to_state IN ('RESERVED', 'UNKNOWN', 'RELEASED', 'RECONCILED')
             AND (from_state IS NULL OR from_state IN ('RESERVED', 'UNKNOWN', 'RELEASED', 'RECONCILED'))

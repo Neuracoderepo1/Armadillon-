@@ -12,6 +12,8 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -97,13 +99,90 @@ func TestCanCover(t *testing.T) {
 
 func quietLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
+// The reservation suite runs in its own throwaway schema. Other packages'
+// tests share the same database and some are destructive (internal/store
+// does TRUNCATE tenants CASCADE), and `go test ./...` runs packages in
+// parallel, so sharing public tables would let them wipe or deadlock with
+// this suite.
+var isoDSN string
+
+func TestMain(m *testing.M) {
+	base := os.Getenv("VG_TEST_POSTGRES_DSN")
+	if base == "" {
+		os.Exit(m.Run())
+	}
+	dsn, drop, err := setupIsolatedSchema(base)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "reservation tests: cannot create isolated schema:", err)
+		os.Exit(1)
+	}
+	isoDSN = dsn
+	code := m.Run()
+	drop()
+	os.Exit(code)
+}
+
+func setupIsolatedSchema(base string) (string, func(), error) {
+	u, err := url.Parse(base)
+	if err != nil || u.Host == "" {
+		return "", nil, fmt.Errorf("VG_TEST_POSTGRES_DSN must be a postgres:// URL: %v", err)
+	}
+	admin, err := sql.Open("postgres", base)
+	if err != nil {
+		return "", nil, err
+	}
+	schema := fmt.Sprintf("vgt_%d_%d", os.Getpid(), time.Now().UnixNano())
+	if _, err := admin.Exec("CREATE SCHEMA " + schema); err != nil {
+		admin.Close()
+		return "", nil, err
+	}
+	drop := func() {
+		_, _ = admin.Exec("DROP SCHEMA " + schema + " CASCADE")
+		admin.Close()
+	}
+	q := u.Query()
+	q.Set("search_path", schema)
+	u.RawQuery = q.Encode()
+	iso, err := sql.Open("postgres", u.String())
+	if err != nil {
+		drop()
+		return "", nil, err
+	}
+	defer iso.Close()
+	files, err := filepath.Glob(filepath.Join("..", "..", "migrations", "*.sql"))
+	if err != nil || len(files) == 0 {
+		drop()
+		return "", nil, fmt.Errorf("no migrations found: %v", err)
+	}
+	sort.Strings(files)
+	for _, f := range files {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			drop()
+			return "", nil, err
+		}
+		var kept []string
+		for _, line := range strings.Split(string(b), "\n") {
+			// Extensions are database-wide and installed by the CI/migration step.
+			if strings.HasPrefix(strings.TrimSpace(strings.ToUpper(line)), "CREATE EXTENSION") {
+				continue
+			}
+			kept = append(kept, line)
+		}
+		if _, err := iso.Exec(strings.Join(kept, "\n")); err != nil {
+			drop()
+			return "", nil, fmt.Errorf("apply %s: %v", f, err)
+		}
+	}
+	return u.String(), drop, nil
+}
+
 func testDSN(t *testing.T) string {
 	t.Helper()
-	dsn := os.Getenv("VG_TEST_POSTGRES_DSN")
-	if dsn == "" {
+	if isoDSN == "" {
 		t.Skip("VG_TEST_POSTGRES_DSN not set; skipping live Postgres reservation tests")
 	}
-	return dsn
+	return isoDSN
 }
 
 func openDB(t *testing.T, dsn string) *sql.DB {
