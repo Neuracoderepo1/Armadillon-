@@ -63,6 +63,12 @@ type Reservation struct {
 	// Set once reconciled.
 	ActualCost money.Micros
 	Reconciled bool
+
+	// Populated by the PostgreSQL implementation (PGManager). IdempotencyKey
+	// is empty for unkeyed reservations. PendingActual is a provider result
+	// that was durably recorded but not yet reconciled (see RecordPendingActual).
+	IdempotencyKey string
+	PendingActual  *money.Micros
 }
 
 // account holds the live financial state for one tenant. All mutation goes
