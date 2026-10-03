@@ -36,7 +36,7 @@ type tenantCtxKey struct{}
 
 type Server struct {
 	GW     *gateway.Gateway
-	Reserv *reservation.Manager
+	Reserv reservation.Repository
 	Risk   *risk.Engine
 	Ledger *ledger.Ledger
 	Store  store.Store // control-plane auth; see requireAuth
@@ -78,7 +78,7 @@ func (s *Server) SetRateLimits(ipRPS, ipBurst, tenantRPS, tenantBurst float64) {
 // trusting a client-supplied tenant header (see requireAuth). operatorToken
 // authenticates the kill switch; pass "" only in local/dev contexts where
 // the kill switch should be unreachable rather than silently open.
-func NewServer(gw *gateway.Gateway, rm *reservation.Manager, re *risk.Engine, l *ledger.Ledger, st store.Store, route gateway.RouteConfig, operatorToken string) *Server {
+func NewServer(gw *gateway.Gateway, rm reservation.Repository, re *risk.Engine, l *ledger.Ledger, st store.Store, route gateway.RouteConfig, operatorToken string) *Server {
 	s := &Server{GW: gw, Reserv: rm, Risk: re, Ledger: l, Store: st, Route: route, OperatorToken: operatorToken, mux: http.NewServeMux()}
 	s.routes()
 	return s

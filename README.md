@@ -58,19 +58,33 @@ scopes, has a secured kill switch and upstream proxy, per-IP/per-tenant
 rate limiting, and request timeouts; CI runs the full suite with
 `-race` against a live Postgres service container.
 
-**Reservation durability — in progress.** The reservation state machine
-has been corrected: a reservation whose TTL expires now moves to
-`UNKNOWN` rather than silently returning budget (see
+**Reservation durability.** The reservation state machine is corrected
+and now durable. A reservation whose TTL expires moves to `UNKNOWN`
+rather than silently returning budget (see
 `internal/reservation/reservation.go`'s `State` doc comment) — only an
 explicit, audited resolution (`ResolveUnknownReleased` /
 `ResolveUnknownReconciled`), never a bare timeout, can determine what
-actually happened. The matching durable schema is in
-`migrations/0002_financial_control.sql` (verified against a real
-Postgres 16 instance, including that the CHECK constraints reject
-invalid state/column combinations). **Not yet done:** reservations
-still live only in an in-memory map (`internal/reservation`) — the
-Postgres-backed repository that makes this durable across restarts,
-the OpenAI-specific usage-parsing adapter, the recovery worker that
-resolves `UNKNOWN` reservations, and admin HTTP routes are still
-queued. `internal/provider` (GenericHTTP forwarding, SSRF allowlist)
-still has no test coverage.
+actually happened. `internal/reservation.Repository` is the interface
+the rest of the app depends on; `Manager` (in-memory) and
+`PostgresRepository` (`migrations/0002_financial_control.sql`) both
+implement it and are proven behaviorally identical by a shared test
+suite run against both, including the "never overcommit under
+concurrency" invariant run with `-race` against a real Postgres
+instance. Set `VG_STORE_MODE=postgres` to use it — `cmd/gateway`
+selects the durable backend automatically and logs which one it's
+using. Verified end-to-end over real HTTP against a live Postgres
+instance (reservation row and budget totals confirmed in the
+database, not just in the HTTP response).
+
+**Not yet done:** there is no periodic sweep calling `ExpireStale` in
+`cmd/gateway` — a reservation only moves to `UNKNOWN` if something
+calls it, and nothing does yet. The OpenAI-specific usage-parsing
+adapter, the recovery worker that resolves `UNKNOWN` reservations, and
+admin HTTP routes (tenant/key/budget provisioning — there is currently
+no way to do this except direct SQL or writing a one-off Go program
+against the `store`/`reservation` packages) are still queued.
+`internal/provider` (GenericHTTP forwarding, SSRF allowlist) still has
+no test coverage. `budget_accounts` supports hourly/daily/monthly
+periods in its schema, but neither `Manager` nor `PostgresRepository`
+implements multi-period budgets or period rollover — both use a single
+flat limit per tenant, pinned to the `daily` period value.

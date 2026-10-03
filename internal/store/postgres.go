@@ -46,6 +46,13 @@ func OpenPostgresStore(ctx context.Context, dsn string) (*PostgresStore, error) 
 
 func (p *PostgresStore) Close() error { return p.db.Close() }
 
+// DB exposes the underlying connection pool so other durable components
+// backed by the same Postgres database — currently
+// reservation.PostgresRepository — can share it instead of opening a
+// second pool (and a second set of SetMaxOpenConns/lifetime settings)
+// against the same instance.
+func (p *PostgresStore) DB() *sql.DB { return p.db }
+
 func (p *PostgresStore) CreateTenant(ctx context.Context, name, slug string) (Tenant, error) {
 	const q = `
 		INSERT INTO tenants (name, slug)

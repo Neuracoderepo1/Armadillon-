@@ -79,6 +79,35 @@ func (a *account) available() money.Micros {
 	return a.limit - a.reserved - a.settled
 }
 
+// Repository is the full contract the rest of the application (risk
+// engine, gateway, HTTP API, and — once built — the recovery worker and
+// admin routes) depends on. *Manager (in-memory, this file) and
+// *PostgresRepository (postgres.go) both satisfy it, so callers don't
+// know or care which backend they're talking to.
+//
+// No context.Context parameter: this mirrors Manager's existing
+// synchronous, non-cancellable design rather than introducing ctx
+// threading through risk/gateway/httpapi as part of this change.
+// PostgresRepository's queries use a background context internally;
+// each call is a single short transaction, so this is a scoping choice,
+// not a correctness gap — but it does mean a caller can't cancel an
+// in-flight Reserve/Reconcile against Postgres. Revisit if that's ever
+// needed.
+type Repository interface {
+	SetBudget(tenantID string, limit money.Micros)
+	Exposure(tenantID string) Exposure
+	Reserve(tenantID string, amount money.Micros, ttl time.Duration) (*Reservation, error)
+	Release(reservationID string) error
+	Reconcile(reservationID string, actualCost money.Micros) (ReconcileResult, error)
+	ExpireStale() int
+	ResolveUnknownReleased(reservationID string) error
+	ResolveUnknownReconciled(reservationID string, actualCost money.Micros) (ReconcileResult, error)
+	Get(reservationID string) (*Reservation, error)
+}
+
+// compile-time check: Manager must keep satisfying Repository.
+var _ Repository = (*Manager)(nil)
+
 type Manager struct {
 	mu           sync.RWMutex
 	accounts     map[string]*account

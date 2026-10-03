@@ -36,6 +36,7 @@ func main() {
 
 	ctx := context.Background()
 	var st store.Store
+	var rm reservation.Repository
 	switch cfg.StoreMode {
 	case config.StoreModePostgres:
 		ps, err := store.OpenPostgresStore(ctx, cfg.PostgresDSN)
@@ -43,11 +44,20 @@ func main() {
 			log.Fatalf("connecting to postgres control plane: %v", err)
 		}
 		st = ps
+		// Durable reservations: shares ps's connection pool rather than
+		// opening a second one. This is what actually makes "financial
+		// firewall" true across restarts — see
+		// migrations/0002_financial_control.sql and the State doc
+		// comment in internal/reservation/reservation.go for the
+		// corrected UNKNOWN-state safety rule this backend enforces at
+		// the database layer, not just in Go.
+		rm = reservation.NewPostgresRepository(ps.DB())
+		log.Printf("reservation backend: postgres (durable across restarts)")
 	default:
 		st = store.NewMemoryStore()
+		rm = reservation.NewManager()
+		log.Printf("reservation backend: in-memory (lost on restart — use VG_STORE_MODE=postgres for production)")
 	}
-
-	rm := reservation.NewManager()
 
 	// The auto-created demo tenant (with its plaintext key printed to
 	// stdout) only makes sense in memory/dev mode, where the process

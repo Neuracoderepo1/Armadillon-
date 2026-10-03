@@ -24,13 +24,13 @@ type RouteConfig struct {
 
 type Gateway struct {
 	Risk      *risk.Engine
-	Reserv    *reservation.Manager
+	Reserv    reservation.Repository
 	Pricing   *pricing.Registry
 	Providers *provider.Registry
 	Ledger    *ledger.Ledger
 }
 
-func New(riskEngine *risk.Engine, reserv *reservation.Manager, pr *pricing.Registry, providers *provider.Registry, l *ledger.Ledger) *Gateway {
+func New(riskEngine *risk.Engine, reserv reservation.Repository, pr *pricing.Registry, providers *provider.Registry, l *ledger.Ledger) *Gateway {
 	return &Gateway{Risk: riskEngine, Reserv: reserv, Pricing: pr, Providers: providers, Ledger: l}
 }
 
