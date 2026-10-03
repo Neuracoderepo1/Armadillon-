@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"testing"
 )
@@ -158,9 +159,19 @@ func TestMemoryStore(t *testing.T) {
 }
 
 // TestPostgresStore runs the identical suite against a real Postgres
-// instance. It is SKIPPED unless VG_TEST_POSTGRES_DSN is set — this
-// sandbox could not install a working local Postgres server (apt
-// mirror had a broken package set), so this path has NOT been run here.
+// instance. It is SKIPPED unless VG_TEST_POSTGRES_DSN is set.
+//
+// This has now actually been run against a real local Postgres 16
+// instance (not just CI's fresh-per-run container) — doing so surfaced
+// a real bug: uniqueSlug() builds slugs from t.Name() plus an
+// in-process counter, which is deterministic across separate `go test`
+// invocations. Against CI's disposable per-run Postgres container that
+// never mattered, but against any persistent Postgres (e.g. a
+// developer's local instance run twice in a row) the second run hit
+// unique-slug violations from the first run's leftover rows, so the
+// suite silently only ever worked once per database lifetime. Fixed by
+// truncating the tables this suite touches before each Postgres run, so
+// it's idempotent regardless of what's already in the database.
 //
 //	Run it for real via: docker compose up -d postgres && \
 //	  VG_TEST_POSTGRES_DSN="postgres://vg:vg@localhost:5432/vg?sslmode=disable" go test ./internal/store/...
@@ -170,6 +181,19 @@ func TestPostgresStore(t *testing.T) {
 		t.Skip("VG_TEST_POSTGRES_DSN not set; skipping live Postgres store tests")
 	}
 	ctx := context.Background()
+
+	cleanupDB, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("opening cleanup connection: %v", err)
+	}
+	defer cleanupDB.Close()
+	// CASCADE reaches api_keys, budget_accounts, and reservations (all
+	// FK-reference tenants), so this alone resets everything this test
+	// file can have written.
+	if _, err := cleanupDB.ExecContext(ctx, "TRUNCATE tenants CASCADE"); err != nil {
+		t.Fatalf("truncating tables before test run: %v", err)
+	}
+
 	ps, err := OpenPostgresStore(ctx, dsn)
 	if err != nil {
 		t.Fatalf("OpenPostgresStore: %v", err)

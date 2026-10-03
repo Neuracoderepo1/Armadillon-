@@ -40,3 +40,17 @@ func Min(a, b Micros) Micros {
 	}
 	return b
 }
+
+// --- Postgres boundary ---
+//
+// The `reservations`/`budget_accounts` schema (migrations/0002_...) stores
+// amounts in a BIGINT column named `*_minor_units`. In this codebase that
+// name is defined to mean exactly one thing: the same Micros integer used
+// everywhere in Go, stored as-is — NOT the ISO 4217 sense of "minor unit"
+// (e.g. cents, 2 decimal places). Money never leaves Go as anything other
+// than Micros; these two functions are the single named seam where that
+// int64 crosses into/out of a database column, so a future change to the
+// on-disk scale (e.g. to true cents) only ever touches this one place
+// instead of every call site that touches the DB.
+func ToMinorUnits(m Micros) int64   { return int64(m) }
+func FromMinorUnits(v int64) Micros { return Micros(v) }

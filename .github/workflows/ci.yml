@@ -62,9 +62,19 @@ jobs:
       - name: go build
         run: go build ./...
 
+      # Compiles every test package without running it, so a broken test
+      # file can never hide behind a skipped suite.
+      - name: go test (compile only)
+        run: go test ./... -run '^$'
+
       # -race is deliberate, not incidental: this project's core promise
       # is a concurrency-safe budget invariant (reserved+settled <=
       # limit), so every CI run must exercise the race detector, not
       # just pass/fail on functional assertions.
       - name: go test (race)
         run: go test -race -count=1 ./...
+
+      # The durable ledger (PGManager) is the money path: repeat its race +
+      # Postgres suite to shake out ordering-dependent failures.
+      - name: reservation ledger (race, x10)
+        run: go test ./internal/reservation -race -count=10
