@@ -158,6 +158,23 @@ var auditChecks = []auditCheck{
 		 WHERE EXISTS (SELECT 1 FROM reservation_events e WHERE e.reservation_id = r.id AND e.to_state = 'RELEASED')
 		   AND EXISTS (SELECT 1 FROM reservation_events e WHERE e.reservation_id = r.id AND e.to_state = 'RECONCILED')`},
 
+	// ---- resolution records (reservation_reconciliations, migration 0004) ----
+	{"resolution_record_state_mismatch", `
+		SELECT r.id::text || ' tenant=' || r.tenant_id::text || ' record_outcome=' || c.outcome || ' state=' || r.state
+		  FROM reservation_reconciliations c JOIN reservations r ON r.id = c.reservation_id
+		 WHERE (c.outcome = 'RELEASED' AND r.state <> 'RELEASED')
+		    OR (c.outcome = 'RECONCILED'
+		        AND (r.state <> 'RECONCILED' OR c.actual_cost_minor_units IS DISTINCT FROM r.actual_cost_minor_units))`},
+	{"resolution_record_invalid_shape", `
+		SELECT r.id::text || ' tenant=' || r.tenant_id::text || ' record_outcome=' || c.outcome
+		  FROM reservation_reconciliations c JOIN reservations r ON r.id = c.reservation_id
+		 WHERE (c.outcome = 'RECONCILED' AND c.actual_cost_minor_units IS NULL)
+		    OR (c.outcome = 'RELEASED' AND c.actual_cost_minor_units IS NOT NULL)`},
+	{"multiple_resolution_records", `
+		SELECT r.id::text || ' tenant=' || r.tenant_id::text || ' records=' || count(*)
+		  FROM reservation_reconciliations c JOIN reservations r ON r.id = c.reservation_id
+		 GROUP BY r.id, r.tenant_id HAVING count(*) > 1`},
+
 	// ---- idempotency integrity ----
 	{"duplicate_idempotency_key", `
 		SELECT 'tenant=' || r.tenant_id::text || ' key=' || r.idempotency_key || ' reservations=' || count(*)

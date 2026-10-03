@@ -1603,3 +1603,70 @@ func TestPG_Stress_LedgerStaysConsistent(t *testing.T) {
 	}
 	requireClean(t, db, needles...)
 }
+
+// ---------------------------------------------------------------------------
+// reservation_reconciliations (migration 0004): one resolution record per
+// reservation, keys no longer collide across tenants.
+// ---------------------------------------------------------------------------
+
+func TestPG_ResolutionRecords_OncePerReservation(t *testing.T) {
+	dsn := testDSN(t)
+	m, db := newMgr(t, dsn)
+	f := newAuditFixture(t, m, db)
+	other := newAuditFixture(t, m, db)
+
+	ins := func(reservationID, key, outcome string, actual any) error {
+		return execErr(db, `INSERT INTO reservation_reconciliations (reservation_id, idempotency_key, outcome, actual_cost_minor_units, resolved_by)
+			VALUES ($1,$2,$3,$4,'test')`, reservationID, key, outcome, actual)
+	}
+
+	// A matching record is clean.
+	if err := ins(f.reconciled, "shared-key", "RECONCILED", int64(usd(60))); err != nil {
+		t.Fatalf("first resolution record: %v", err)
+	}
+	if err := ins(f.released, "rel-key", "RELEASED", nil); err != nil {
+		t.Fatalf("released record: %v", err)
+	}
+	requireClean(t, db, f.needles()...)
+
+	// At most one resolution record per reservation, whatever key it carries.
+	expectPQ(t, "second record, different key", ins(f.reconciled, "another-key", "RECONCILED", int64(usd(60))), "23505")
+	expectPQ(t, "second record, same key", ins(f.reconciled, "shared-key", "RECONCILED", int64(usd(60))), "23505")
+
+	// The same key for a different reservation (different tenant) is independent.
+	if err := ins(other.reconciled, "shared-key", "RECONCILED", int64(usd(60))); err != nil {
+		t.Fatalf("keys must not collide across tenants: %v", err)
+	}
+
+	// Shape: RECONCILED needs an actual cost, RELEASED must not carry one.
+	expectPQ(t, "RECONCILED without actual", ins(f.reserved, "k-a", "RECONCILED", nil), "23514")
+	expectPQ(t, "RELEASED with actual", ins(f.reserved, "k-b", "RELEASED", int64(1)), "23514")
+	expectPQ(t, "unknown outcome", ins(f.reserved, "k-c", "EXPIRED", nil), "23514")
+	requireClean(t, db, f.needles()...)
+	requireClean(t, db, other.needles()...)
+
+	// The auditor catches a record that contradicts the reservation.
+	if err := ins(f.reserved, "lie-1", "RELEASED", nil); err != nil {
+		t.Fatal(err)
+	}
+	got := auditScoped(t, db, f.reserved)
+	found := false
+	for _, v := range got {
+		found = found || strings.HasPrefix(v, "resolution_record_state_mismatch:")
+	}
+	if !found {
+		t.Fatalf("auditor missed a RELEASED record on a RESERVED reservation: %v", got)
+	}
+	execOrFatal(t, db, `DELETE FROM reservation_reconciliations WHERE reservation_id=$1`, f.reserved)
+
+	// Amount disagreement is also caught.
+	execOrFatal(t, db, `UPDATE reservation_reconciliations SET actual_cost_minor_units = actual_cost_minor_units + 1 WHERE reservation_id=$1`, other.reconciled)
+	got = auditScoped(t, db, other.reconciled)
+	found = false
+	for _, v := range got {
+		found = found || strings.HasPrefix(v, "resolution_record_state_mismatch:")
+	}
+	if !found {
+		t.Fatalf("auditor missed a RECONCILED record with the wrong amount: %v", got)
+	}
+}
