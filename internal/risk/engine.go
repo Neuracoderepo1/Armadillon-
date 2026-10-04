@@ -127,14 +127,14 @@ type tenantState struct {
 type Engine struct {
 	mu           sync.Mutex
 	tenants      map[string]*tenantState
-	reserv       *reservation.Manager
+	reserv       reservation.Service
 	policy       Policy
 	killAll      bool
 	killTenant   map[string]bool
 	killProvider map[string]bool
 }
 
-func NewEngine(reserv *reservation.Manager, policy Policy) *Engine {
+func NewEngine(reserv reservation.Service, policy Policy) *Engine {
 	return &Engine{
 		tenants:      make(map[string]*tenantState),
 		reserv:       reserv,

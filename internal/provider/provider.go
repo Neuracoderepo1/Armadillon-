@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -144,7 +145,7 @@ func (p *GenericHTTP) Name() string { return p.NameStr }
 
 func (p *GenericHTTP) Execute(ctx context.Context, req ExecRequest) (Response, Usage, error) {
 	if len(req.Body) > MaxUpstreamRequestBytes {
-		return Response{}, Usage{}, fmt.Errorf("provider: request body of %d bytes exceeds %d byte limit", len(req.Body), MaxUpstreamRequestBytes)
+		return Response{}, Usage{}, NotDispatched(fmt.Errorf("provider: request body of %d bytes exceeds %d byte limit", len(req.Body), MaxUpstreamRequestBytes))
 	}
 
 	base := strings.TrimRight(p.BaseURL, "/")
@@ -156,25 +157,33 @@ func (p *GenericHTTP) Execute(ctx context.Context, req ExecRequest) (Response, U
 
 	httpReq, err := http.NewRequestWithContext(ctx, req.Method, target, bytes.NewReader(req.Body))
 	if err != nil {
-		return Response{}, Usage{}, fmt.Errorf("provider: building request: %w", err)
+		return Response{}, Usage{}, NotDispatched(fmt.Errorf("provider: building request: %w", err))
 	}
 
 	// Scheme allowlist and no-embedded-credentials, even though target
 	// is operator-built — cheap to verify and catches misconfiguration.
 	if httpReq.URL.Scheme != "http" && httpReq.URL.Scheme != "https" {
-		return Response{}, Usage{}, fmt.Errorf("provider: upstream scheme %q is not http/https", httpReq.URL.Scheme)
+		return Response{}, Usage{}, NotDispatched(fmt.Errorf("provider: upstream scheme %q is not http/https", httpReq.URL.Scheme))
 	}
 	if httpReq.URL.User != nil {
-		return Response{}, Usage{}, errors.New("provider: upstream URL must not contain embedded credentials")
+		return Response{}, Usage{}, NotDispatched(errors.New("provider: upstream URL must not contain embedded credentials"))
 	}
 	if len(p.AllowedHosts) > 0 && !p.AllowedHosts[httpReq.URL.Host] {
-		return Response{}, Usage{}, fmt.Errorf("provider: host %q is not in the SSRF allowlist for %q", httpReq.URL.Host, p.NameStr)
+		return Response{}, Usage{}, NotDispatched(fmt.Errorf("provider: host %q is not in the SSRF allowlist for %q", httpReq.URL.Host, p.NameStr))
 	}
 
 	httpReq.Header = FilterHopByHopHeaders(req.Headers)
 
+	if cerr := ctx.Err(); cerr != nil {
+		return Response{}, Usage{}, NotDispatched(cerr) // cancelled before anything was sent
+	}
 	resp, err := p.Client.Do(httpReq)
 	if err != nil {
+		if isDialError(err) {
+			return Response{}, Usage{}, NotDispatched(err) // connection never established
+		}
+		// Timeouts, resets and EOFs after the connection is up are AMBIGUOUS:
+		// the upstream may have received, executed and billed the request.
 		return Response{}, Usage{}, err
 	}
 	defer resp.Body.Close()
@@ -197,6 +206,37 @@ func (p *GenericHTTP) Execute(ctx context.Context, req ExecRequest) (Response, U
 }
 
 var ErrProviderNotFound = errors.New("provider: not registered")
+
+// NotDispatchedError marks an Execute failure that PROVES the request never
+// reached the upstream (invalid request, blocked by the SSRF allowlist,
+// connection never established, context already cancelled). Only these
+// failures allow the gateway to return the reserved budget. Every other
+// error is ambiguous: the upstream may have executed and billed the call.
+type NotDispatchedError struct{ Err error }
+
+func (e *NotDispatchedError) Error() string { return e.Err.Error() }
+func (e *NotDispatchedError) Unwrap() error { return e.Err }
+
+// NotDispatched wraps err as a proven pre-dispatch failure.
+func NotDispatched(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &NotDispatchedError{Err: err}
+}
+
+// IsNotDispatched reports whether err is a proven pre-dispatch failure.
+func IsNotDispatched(err error) bool {
+	var n *NotDispatchedError
+	return errors.As(err, &n)
+}
+
+// isDialError reports a failure while establishing the connection, i.e.
+// before any request bytes could have been sent.
+func isDialError(err error) bool {
+	var op *net.OpError
+	return errors.As(err, &op) && op.Op == "dial"
+}
 
 type Registry struct {
 	providers map[string]Provider

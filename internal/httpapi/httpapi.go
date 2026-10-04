@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -36,7 +37,11 @@ type tenantCtxKey struct{}
 
 type Server struct {
 	GW     *gateway.Gateway
-	Reserv *reservation.Manager
+	Reserv reservation.Service
+
+	// ready, when set, gates /readyz (durable mode: database reachable, startup
+	// recovery done, maintenance healthy). /health stays a pure liveness probe.
+	ready  func(context.Context) error
 	Risk   *risk.Engine
 	Ledger *ledger.Ledger
 	Store  store.Store // control-plane auth; see requireAuth
@@ -78,7 +83,7 @@ func (s *Server) SetRateLimits(ipRPS, ipBurst, tenantRPS, tenantBurst float64) {
 // trusting a client-supplied tenant header (see requireAuth). operatorToken
 // authenticates the kill switch; pass "" only in local/dev contexts where
 // the kill switch should be unreachable rather than silently open.
-func NewServer(gw *gateway.Gateway, rm *reservation.Manager, re *risk.Engine, l *ledger.Ledger, st store.Store, route gateway.RouteConfig, operatorToken string) *Server {
+func NewServer(gw *gateway.Gateway, rm reservation.Service, re *risk.Engine, l *ledger.Ledger, st store.Store, route gateway.RouteConfig, operatorToken string) *Server {
 	s := &Server{GW: gw, Reserv: rm, Risk: re, Ledger: l, Store: st, Route: route, OperatorToken: operatorToken, mux: http.NewServeMux()}
 	s.routes()
 	return s
@@ -97,6 +102,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("/health", s.handleHealth)
+	s.mux.HandleFunc("/readyz", s.handleReady)
 	// Tenant-scoped endpoints require a valid API key AND the matching
 	// scope. The kill-switch endpoint is operator-only and authenticated
 	// separately (requireOperator) — tenant API keys, of any scope, are
@@ -218,6 +224,24 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// SetReadiness installs the readiness check behind /readyz. Without one the
+// service is considered ready (in-memory/dev mode has nothing to wait for).
+func (s *Server) SetReadiness(fn func(context.Context) error) { s.ready = fn }
+
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	if s.ready != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := s.ready(ctx); err != nil {
+			// Do not leak internals to unauthenticated callers; details are in logs.
+			log.Printf("readiness check failed: %v", err)
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not_ready"})
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

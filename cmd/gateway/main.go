@@ -10,9 +10,14 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"velocityguard/internal/config"
@@ -47,7 +52,49 @@ func main() {
 		st = store.NewMemoryStore()
 	}
 
-	rm := reservation.NewManager()
+	// The reservation ledger. In postgres mode it is the DURABLE PGManager:
+	// reservations, pending actuals and settlements survive restarts and are
+	// shared by every instance. In memory mode it is the in-process Manager,
+	// which is for demos/tests only: nothing survives a restart.
+	runCtx, stopRun := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stopRun()
+	var rm reservation.Service
+	var maint *reservation.Maintenance
+	if cfg.StoreMode == config.StoreModePostgres {
+		db, err := sql.Open("postgres", cfg.PostgresDSN)
+		if err != nil {
+			log.Fatalf("opening reservation ledger database: %v", err)
+		}
+		db.SetMaxOpenConns(25)
+		db.SetMaxIdleConns(10)
+		db.SetConnMaxLifetime(30 * time.Minute)
+		pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		if err := db.PingContext(pctx); err != nil {
+			cancel()
+			log.Fatalf("reservation ledger database unreachable: %v", err)
+		}
+		cancel()
+		pg := reservation.NewPGManager(db, slog.Default())
+		rm = pg
+		maint = reservation.NewMaintenance(pg, slog.Default())
+
+		// Startup recovery: settle every durably recorded provider result left by
+		// a previous crash BEFORE advertising readiness. Failures do not abort
+		// startup; /readyz stays 503 and the loop below keeps retrying.
+		for attempt := 1; attempt <= 3; attempt++ {
+			if err := maint.RunOnce(runCtx); err == nil {
+				break
+			}
+			if attempt < 3 {
+				time.Sleep(2 * time.Second)
+			}
+		}
+		go maint.Run(runCtx, 5*time.Second)
+		log.Printf("reservation ledger: durable PostgreSQL manager active (expiry + recovery worker running)")
+	} else {
+		rm = reservation.NewManager()
+		log.Printf("WARNING: in-memory reservation ledger (VG_STORE_MODE=memory): holds and settlements are lost on restart; use postgres mode for real spend control")
+	}
 
 	// The auto-created demo tenant (with its plaintext key printed to
 	// stdout) only makes sense in memory/dev mode, where the process
@@ -114,6 +161,9 @@ func main() {
 
 	route := gateway.RouteConfig{Route: "/agent/execute", Provider: "demo-provider", Model: "demo-model"}
 	srv := httpapi.NewServer(gw, rm, re, l, st, route, cfg.OperatorToken)
+	if maint != nil {
+		srv.SetReadiness(maint.Ready)
+	}
 	srv.SetRateLimits(cfg.RateLimitIPPerSec, cfg.RateLimitIPBurst, cfg.RateLimitTenantPerSec, cfg.RateLimitTenantBurst)
 
 	log.Printf("VelocityGuard gateway listening on %s (store mode: %s)", cfg.Addr, cfg.StoreMode)

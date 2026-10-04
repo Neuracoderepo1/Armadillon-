@@ -25,10 +25,13 @@ const (
 	CostReconciled      EventType = "COST_RECONCILED"
 	ReservationReleased EventType = "RESERVATION_RELEASED"
 	ReservationExpired  EventType = "RESERVATION_EXPIRED"
-	CircuitOpened       EventType = "CIRCUIT_OPENED"
-	CircuitClosed       EventType = "CIRCUIT_CLOSED"
-	KillSwitchOn        EventType = "KILL_SWITCH_ACTIVATED"
-	KillSwitchOff       EventType = "KILL_SWITCH_DEACTIVATED"
+	// ReservationUnknown: an upstream failure did not prove the request was never
+	// dispatched, so the hold was kept (not released) for recovery.
+	ReservationUnknown EventType = "RESERVATION_UNKNOWN"
+	CircuitOpened      EventType = "CIRCUIT_OPENED"
+	CircuitClosed      EventType = "CIRCUIT_CLOSED"
+	KillSwitchOn       EventType = "KILL_SWITCH_ACTIVATED"
+	KillSwitchOff      EventType = "KILL_SWITCH_DEACTIVATED"
 
 	// LegacyUnscopedKeyUsed fires whenever a key with no Scopes set
 	// passes a scope-gated request purely via the legacy compatibility
