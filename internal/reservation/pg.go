@@ -929,3 +929,55 @@ func (p *PGManager) expireBatch() (int, error) {
 	})
 	return n, err
 }
+
+// UnknownSummary describes the unresolved-UNKNOWN backlog: the exposure that is
+// held but neither settled nor released. Operators use it to alert on age.
+type UnknownSummary struct {
+	Count         int
+	Held          money.Micros
+	OldestAge     time.Duration
+	OldestCreated time.Time
+}
+
+// ListUnknown returns up to limit UNKNOWN reservations (oldest first),
+// optionally restricted to one tenant, plus a summary of the whole backlog.
+// It is read-only.
+func (p *PGManager) ListUnknown(tenantID string, limit int) ([]*Reservation, UnknownSummary, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	ctx, cancel := p.ctx()
+	defer cancel()
+	var sum UnknownSummary
+	var held int64
+	var oldest sql.NullTime
+	err := p.db.QueryRowContext(ctx, `
+		SELECT count(*), COALESCE(sum(amount_minor_units),0), min(created_at)
+		  FROM reservations
+		 WHERE state='UNKNOWN' AND ($1 = '' OR tenant_id::text = $1)`, tenantID).Scan(&sum.Count, &held, &oldest)
+	if err != nil {
+		return nil, sum, p.classify(err)
+	}
+	sum.Held = money.FromMinorUnits(held)
+	if oldest.Valid {
+		sum.OldestCreated = oldest.Time
+		sum.OldestAge = time.Since(oldest.Time)
+	}
+	rows, err := p.db.QueryContext(ctx, `SELECT `+reservationCols+`
+		  FROM reservations
+		 WHERE state='UNKNOWN' AND ($1 = '' OR tenant_id::text = $1)
+		 ORDER BY created_at, id LIMIT $2`, tenantID, limit)
+	if err != nil {
+		return nil, sum, p.classify(err)
+	}
+	defer rows.Close()
+	var out []*Reservation
+	for rows.Next() {
+		r, err := scanReservation(rows)
+		if err != nil {
+			return nil, sum, p.classify(err)
+		}
+		out = append(out, r)
+	}
+	return out, sum, p.classify(rows.Err())
+}

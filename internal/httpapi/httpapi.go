@@ -60,6 +60,10 @@ type Server struct {
 	// always configures both for real deployments; see main.go.
 	ipLimiter     *limiter
 	tenantLimiter *limiter
+
+	// Resolver enables the operator UNKNOWN-resolution routes (durable mode
+	// only; nil means they answer 404). See resolve.go.
+	Resolver UnknownResolver
 }
 
 // SetRateLimits enables per-IP and per-tenant request rate limiting.
@@ -111,6 +115,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/v1/events", s.requireAuth(ScopeReadEvents, s.handleEvents))
 	s.mux.HandleFunc("/v1/kill-switch", s.requireOperator(s.handleKillSwitch))
 	s.mux.HandleFunc("/proxy/", s.requireAuth(ScopeProxyWrite, s.handleProxy))
+	s.mux.HandleFunc("/v1/reservations/unknown", s.requireOperator(s.handleListUnknown))
+	s.mux.HandleFunc("/v1/reservations/", s.requireOperator(s.handleReservationAction))
 }
 
 // requireAuth enforces Bearer-token authentication, injects the

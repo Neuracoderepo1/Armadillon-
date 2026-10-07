@@ -78,3 +78,31 @@ jobs:
       # Postgres suite to shake out ordering-dependent failures.
       - name: reservation ledger (race, x10)
         run: go test ./internal/reservation -race -count=10
+
+      # Fault-injection matrix for the money path (crash points, ambiguous
+      # dispatch, TTL expiry, recovery idempotency, racing operator
+      # resolvers). Repeated under -race to shake out ordering-dependent
+      # failures; see internal/reservation/fault_matrix_test.go.
+      - name: fault-injection matrix (race, x10)
+        run: go test ./internal/reservation -race -count=10 -run 'TestFault_|TestE2E_|TestPG_CrashRestart'
+
+  # Static analysis and dependency vulnerabilities. A separate job so a
+  # tooling/advisory change cannot mask (or be masked by) the money-path tests.
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@2024.1.1
+          staticcheck ./...
+
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          govulncheck ./...
