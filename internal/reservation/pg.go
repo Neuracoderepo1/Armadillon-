@@ -584,6 +584,39 @@ func (p *PGManager) Release(id string) error {
 	})
 }
 
+// MarkUnknown moves a RESERVED reservation to UNKNOWN immediately, keeping the
+// hold (budget is NOT returned). The gateway uses it for upstream failures that
+// do not prove the request was never dispatched. Repeating it on an UNKNOWN
+// reservation is a no-op; RELEASED and RECONCILED return ErrTerminalState.
+// A reservation with a durable pending actual is left RESERVED (recovery
+// reconciles it) and the call is a no-op.
+func (p *PGManager) MarkUnknown(id string) error {
+	return p.withTx(func(ctx context.Context, tx *sql.Tx) error {
+		l, err := lockReservation(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		switch l.state {
+		case StateUnknown:
+			return nil
+		case StateReserved:
+			if l.pending.Valid {
+				return nil
+			}
+			res, err := tx.ExecContext(ctx, `UPDATE reservations SET state='UNKNOWN' WHERE id=$1 AND state='RESERVED'`, id)
+			if err != nil {
+				return err
+			}
+			if err := mustOneRow(res, "mark unknown"); err != nil {
+				return err
+			}
+			return addEvent(ctx, tx, id, "RESERVED", "UNKNOWN", "ambiguous_dispatch", l.amount)
+		default:
+			return ErrTerminalState
+		}
+	})
+}
+
 // Reconcile records the provider-reported actual cost. RESERVED -> RECONCILED.
 // Repeating with the same actual is a no-op; a different actual returns
 // ErrConflictingReconcile; RELEASED and UNKNOWN return ErrTerminalState (an

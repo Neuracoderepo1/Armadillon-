@@ -58,19 +58,45 @@ scopes, has a secured kill switch and upstream proxy, per-IP/per-tenant
 rate limiting, and request timeouts; CI runs the full suite with
 `-race` against a live Postgres service container.
 
-**Reservation durability — in progress.** The reservation state machine
-has been corrected: a reservation whose TTL expires now moves to
-`UNKNOWN` rather than silently returning budget (see
-`internal/reservation/reservation.go`'s `State` doc comment) — only an
-explicit, audited resolution (`ResolveUnknownReleased` /
-`ResolveUnknownReconciled`), never a bare timeout, can determine what
-actually happened. The matching durable schema is in
-`migrations/0002_financial_control.sql` (verified against a real
-Postgres 16 instance, including that the CHECK constraints reject
-invalid state/column combinations). **Not yet done:** reservations
-still live only in an in-memory map (`internal/reservation`) — the
-Postgres-backed repository that makes this durable across restarts,
-the OpenAI-specific usage-parsing adapter, the recovery worker that
-resolves `UNKNOWN` reservations, and admin HTTP routes are still
-queued. `internal/provider` (GenericHTTP forwarding, SSRF allowlist)
-still has no test coverage.
+**Reservation durability.** With `VG_STORE_MODE=postgres` the gateway runs
+on `reservation.PGManager`, the durable ledger (`internal/reservation/pg.go`,
+migrations `0002`-`0004`). Every transition is one transaction, so reserved
+and settled balances, idempotency keys and recorded provider results survive
+restarts and are shared by all instances. `memory` mode keeps the in-process
+`Manager`, which is for demos and tests only: nothing survives a restart, and
+the gateway logs a warning at startup.
+
+State machine: `RESERVED` becomes `RELEASED`, `UNKNOWN` or `RECONCILED`;
+`UNKNOWN` becomes `RELEASED` or `RECONCILED`. TTL expiry only moves a hold to
+`UNKNOWN` and never returns budget.
+
+Failure handling in the gateway (the money-critical part):
+
+- A hold is **released** only when the provider proves the request never left
+  (`provider.NotDispatchedError`: connection refused, allowlist rejection,
+  oversized body, cancelled before send).
+- Any other provider failure (timeout, reset, cancellation after send) is
+  **ambiguous**: the hold is kept and the reservation is marked `UNKNOWN`,
+  because the upstream may have executed and billed the call.
+- After a provider success the actual cost is durably recorded **before**
+  reconciliation. A reservation holding a recorded result is never expired or
+  released, and a crash between the two steps is finished by recovery.
+- A background worker (`reservation.Maintenance`) expires stale holds and
+  settles recorded results; multiple instances can run it safely
+  (`FOR UPDATE SKIP LOCKED`). It runs once at startup, and `/readyz` returns
+  503 until that first pass succeeds and while the latest pass is failing or
+  the database is unreachable. `/health` remains a plain liveness probe.
+
+`AuditPG` is a read-only auditor with 27 checks (balances recomputed from
+reservation rows and the event log, referential integrity, event and
+resolution-record consistency, idempotency); any violation is a failure.
+
+**Not done yet:** a way to resolve `UNKNOWN` reservations out-of-band (the
+manager methods `ResolveUnknownReleased` / `ResolveUnknownReconciled` exist,
+but no admin route or provider-side lookup calls them, so UNKNOWN holds stay
+until an operator resolves them); tenant, API-key and budget provisioning in
+postgres mode (there is no admin API; budgets are set through
+`PGManager.SetBudgetE`); the OpenAI-specific usage-parsing adapter; and
+`staticcheck` / `govulncheck` runs. The `NOT VALID` constraints added in
+`0003`/`0004` are not yet validated. A throttled request keeps its hold by
+design (the risk engine relies on it to escalate repeated throttled retries).

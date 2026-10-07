@@ -228,8 +228,74 @@ func (m *Manager) Release(reservationID string) error {
 		// not an error, so retries from upstream failure handling are safe.
 		return nil
 	}
+	if r.PendingActual != nil {
+		return ErrPendingActualExists // the call completed; it must be reconciled, never released
+	}
 	acc.reserved -= r.Amount
 	r.State = StateReleased
+	return nil
+}
+
+// MarkUnknown moves a RESERVED reservation to UNKNOWN WITHOUT returning
+// budget. The gateway calls it when an upstream call failed in a way that
+// does not prove the request was never dispatched (timeout, connection
+// reset, cancellation after send): the provider may have executed and
+// billed it, so the hold must stay until a recovery path resolves it.
+// UNKNOWN is idempotent; any other state is ErrTerminalState.
+func (m *Manager) MarkUnknown(reservationID string) error {
+	m.mu.Lock()
+	r, ok := m.reservations[reservationID]
+	m.mu.Unlock()
+	if !ok {
+		return ErrNotFound
+	}
+	acc := m.getAccount(r.TenantID)
+	acc.mu.Lock()
+	defer acc.mu.Unlock()
+	switch r.State {
+	case StateUnknown:
+		return nil
+	case StateReserved:
+		r.State = StateUnknown
+		return nil
+	default:
+		return ErrTerminalState
+	}
+}
+
+// RecordPendingActual stores a provider result before reconciliation (the
+// in-memory counterpart of the durable PGManager operation). While set,
+// ExpireStale skips the reservation and Release refuses it.
+func (m *Manager) RecordPendingActual(reservationID string, actual money.Micros) error {
+	if actual < 0 {
+		return ErrInvalidAmount
+	}
+	m.mu.Lock()
+	r, ok := m.reservations[reservationID]
+	m.mu.Unlock()
+	if !ok {
+		return ErrNotFound
+	}
+	acc := m.getAccount(r.TenantID)
+	acc.mu.Lock()
+	defer acc.mu.Unlock()
+	switch r.State {
+	case StateReconciled:
+		if r.ActualCost != actual {
+			return ErrConflictingReconcile
+		}
+		return nil
+	case StateReleased:
+		return ErrTerminalState
+	}
+	if r.PendingActual != nil {
+		if *r.PendingActual != actual {
+			return ErrConflictingReconcile
+		}
+		return nil
+	}
+	v := actual
+	r.PendingActual = &v
 	return nil
 }
 
@@ -263,6 +329,9 @@ func (m *Manager) Reconcile(reservationID string, actualCost money.Micros) (Reco
 	}
 	if r.State != StateReserved {
 		return ReconcileResult{}, ErrTerminalState
+	}
+	if r.PendingActual != nil && *r.PendingActual != actualCost {
+		return ReconcileResult{}, ErrConflictingReconcile
 	}
 
 	// Move the reserved amount out of "reserved" and into "settled" at the
@@ -299,7 +368,7 @@ func (m *Manager) ExpireStale() int {
 	m.mu.Lock()
 	var stale []*Reservation
 	for _, r := range m.reservations {
-		if r.State == StateReserved && now.After(r.ExpiresAt) {
+		if r.State == StateReserved && r.PendingActual == nil && now.After(r.ExpiresAt) {
 			stale = append(stale, r)
 		}
 	}
@@ -308,7 +377,7 @@ func (m *Manager) ExpireStale() int {
 	for _, r := range stale {
 		acc := m.getAccount(r.TenantID)
 		acc.mu.Lock()
-		if r.State == StateReserved { // re-check under lock
+		if r.State == StateReserved && r.PendingActual == nil { // re-check under lock
 			// Deliberately no acc.reserved change: the amount stays
 			// held. This is the fix for the critical safety flaw where
 			// TTL expiry silently returned budget for a reservation that
@@ -371,6 +440,9 @@ func (m *Manager) ResolveUnknownReconciled(reservationID string, actualCost mone
 	}
 	if r.State != StateUnknown {
 		return ReconcileResult{}, ErrTerminalState
+	}
+	if r.PendingActual != nil && *r.PendingActual != actualCost {
+		return ReconcileResult{}, ErrConflictingReconcile
 	}
 
 	acc.reserved -= r.Amount
