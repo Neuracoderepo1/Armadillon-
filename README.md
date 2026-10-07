@@ -100,3 +100,29 @@ postgres mode (there is no admin API; budgets are set through
 `staticcheck` / `govulncheck` runs. The `NOT VALID` constraints added in
 `0003`/`0004` are not yet validated. A throttled request keeps its hold by
 design (the risk engine relies on it to escalate repeated throttled retries).
+
+## Operating UNKNOWN reservations
+
+An `UNKNOWN` reservation is a hold whose real-world outcome is unproven (an
+ambiguous provider failure, a TTL expiry, or a throttled request whose hold
+timed out). The budget stays **held** until an operator resolves it. Both
+routes below require the operator token (tenant API keys are never accepted)
+and only exist in durable PostgreSQL mode.
+
+```
+# Backlog + summary (alert on summary.oldest_age_seconds / held_micros)
+GET  /v1/reservations/unknown[?tenant=<id>&limit=<n>]
+
+# Provider confirms the call never billed -> budget returns
+POST /v1/reservations/{id}/resolve
+     {"outcome":"released","evidence":"provider console shows no charge, req 9f3"}
+
+# Provider billed -> settle the real cost (micros; 1 unit = 1,000,000)
+POST /v1/reservations/{id}/resolve
+     {"outcome":"reconciled","actual_micros":30000,"evidence":"invoice #42 line 7"}
+```
+
+`evidence` is mandatory and is recorded in the ledger as `RESERVATION_RESOLVED`.
+Resolving is idempotent; resolving the other way after a terminal outcome
+returns `409`. Schedule `migrations/maintenance/0005_validate_constraints.sql`
+(preflight first) once historical data is certified.

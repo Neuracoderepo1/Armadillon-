@@ -78,3 +78,71 @@ jobs:
       # Postgres suite to shake out ordering-dependent failures.
       - name: reservation ledger (race, x10)
         run: go test ./internal/reservation -race -count=10
+
+      # Fault-injection matrix for the money path (crash points, ambiguous
+      # dispatch, TTL expiry, recovery idempotency, racing operator
+      # resolvers). Repeated under -race to shake out ordering-dependent
+      # failures; see internal/reservation/fault_matrix_test.go.
+      - name: fault-injection matrix (race, x10)
+        run: go test ./internal/reservation -race -count=10 -run 'TestFault_|TestE2E_|TestPG_CrashRestart'
+
+  # The same suite on a current, patched Go toolchain. Go 1.22 is end-of-life
+  # and no longer receives standard-library security fixes (govulncheck reports
+  # reachable crypto/tls, encoding/asn1 and net/url issues on it), so the
+  # deployed binary must be built with a supported toolchain. The `test` job
+  # above deliberately stays on 1.22 to prove go.mod's minimum still builds.
+  test-stable:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: vg
+          POSTGRES_PASSWORD: vg
+          POSTGRES_DB: vg
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U vg -d vg"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      VG_TEST_POSTGRES_DSN: postgres://vg:vg@localhost:5432/vg?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Apply control-plane migrations
+        run: |
+          sudo apt-get update && sudo apt-get install -y postgresql-client
+          for f in migrations/*.sql; do
+            psql "$VG_TEST_POSTGRES_DSN" -v ON_ERROR_STOP=1 -f "$f"
+          done
+      - name: go vet
+        run: go vet ./...
+      - name: go test (race)
+        run: go test -race -count=1 ./...
+
+  # Static analysis and dependency vulnerabilities, on a supported toolchain.
+  # A separate job so a tooling/advisory change cannot mask (or be masked by)
+  # the money-path tests.
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          staticcheck ./...
+
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...

@@ -164,6 +164,9 @@ func main() {
 	if maint != nil {
 		srv.SetReadiness(maint.Ready)
 	}
+	if res, ok := rm.(httpapi.UnknownResolver); ok {
+		srv.SetUnknownResolver(res)
+	}
 	srv.SetRateLimits(cfg.RateLimitIPPerSec, cfg.RateLimitIPBurst, cfg.RateLimitTenantPerSec, cfg.RateLimitTenantBurst)
 
 	log.Printf("VelocityGuard gateway listening on %s (store mode: %s)", cfg.Addr, cfg.StoreMode)
