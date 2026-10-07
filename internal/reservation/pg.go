@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/lib/pq"
+	"github.com/lib/pq/pqerror"
 
 	"velocityguard/internal/money"
 )
@@ -115,7 +116,7 @@ func (p *PGManager) Ping(ctx context.Context) error {
 	return nil
 }
 
-func pqCode(err error) pq.ErrorCode {
+func pqCode(err error) pqerror.Code {
 	var e *pq.Error
 	if errors.As(err, &e) {
 		return e.Code
