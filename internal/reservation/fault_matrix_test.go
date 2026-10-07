@@ -330,3 +330,111 @@ func TestFault_R2_RacingResolvers_ExactlyOneOutcome(t *testing.T) {
 		assertConserved(t, e)
 	}
 }
+
+// C7: the database is unreachable when a request arrives. The gateway must fail
+// closed: no reservation, and above all NO call to the provider.
+func TestFault_C7_DatabaseDownAtRequestStart_NoDispatch(t *testing.T) {
+	dsn := e2eDSN(t)
+	m, db := openPG(t, dsn)
+	tn := tenantWithBudget(t, m, db, money.FromFloat(10))
+
+	var calls int
+	var mu sync.Mutex
+	g := newGateway(m, fnProvider(func(ctx context.Context) (provider.Response, provider.Usage, error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		return okProv(ctx)
+	}), risk.DefaultPolicy())
+
+	// A second pool: the "outage" is the gateway's own pool going away.
+	dead, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadM := reservation.NewPGManager(dead, quiet())
+	deadM.SetOpTimeout(2 * time.Second)
+	_ = dead.Close() // every operation on deadM now fails
+	gDead := newGateway(deadM, fnProvider(func(ctx context.Context) (provider.Response, provider.Usage, error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		return okProv(ctx)
+	}), risk.DefaultPolicy())
+
+	res := handle(gDead, "c7", tn)
+	if res.Executed {
+		t.Fatal("request executed with the ledger down")
+	}
+	mu.Lock()
+	n := calls
+	mu.Unlock()
+	if n != 0 {
+		t.Fatalf("provider was called %d time(s) while the ledger was unavailable", n)
+	}
+	var held int
+	if err := db.QueryRow(`SELECT count(*) FROM reservations WHERE tenant_id=$1`, tn).Scan(&held); err != nil || held != 0 {
+		t.Fatalf("reservations created during outage: %d (%v)", held, err)
+	}
+	// The healthy gateway still works afterwards (no poisoned state).
+	if r := handle(g, "c7-after", tn); r.Err != nil || !r.Executed {
+		t.Fatalf("recovery after outage failed: %+v", r)
+	}
+	assertConserved(t, exposure(t, m, tn))
+}
+
+// failingSettle simulates the database failing after the provider has already
+// answered: neither the pending actual nor the settlement can be written.
+type failingSettle struct{ reservation.Service }
+
+func (failingSettle) RecordPendingActual(string, money.Micros) error {
+	return reservation.ErrBackendUnavailable
+}
+func (failingSettle) Reconcile(string, money.Micros) (reservation.ReconcileResult, error) {
+	return reservation.ReconcileResult{}, reservation.ErrBackendUnavailable
+}
+func (failingSettle) ResolveUnknownReconciled(string, money.Micros) (reservation.ReconcileResult, error) {
+	return reservation.ReconcileResult{}, reservation.ErrBackendUnavailable
+}
+
+// C8: provider billed, then BOTH durable writes fail. The hold must survive
+// (never released), expiry must keep it as UNKNOWN, and an operator can then
+// settle the real cost. This is the worst-case path end to end.
+func TestFault_C8_ProviderBilled_DurableWritesFail_HoldSurvivesToOperator(t *testing.T) {
+	m, db := openPG(t, e2eDSN(t))
+	tn := tenantWithBudget(t, m, db, money.FromFloat(10))
+	g := newGateway(failingSettle{m}, fnProvider(okProv), risk.DefaultPolicy())
+
+	res := handle(g, "c8", tn)
+	if !res.Executed || res.Err == nil {
+		t.Fatalf("expected executed-with-settlement-error, got %+v", res)
+	}
+	id := onlyReservation(t, db, tn)
+	assertState(t, m, id, reservation.StateReserved) // not released, not lost
+	held := exposure(t, m, tn)
+	if held.Reserved == 0 {
+		t.Fatalf("hold was returned although the provider billed: %+v", held)
+	}
+	assertConserved(t, held)
+	// TTL passes with nobody having recorded the result: the hold becomes UNKNOWN.
+	forceExpiry(t, db, id)
+	if _, err := m.ExpireStaleE(); err != nil {
+		t.Fatal(err)
+	}
+	assertState(t, m, id, reservation.StateUnknown)
+	if got := exposure(t, m, tn); got.Reserved != held.Reserved {
+		t.Fatalf("expiry changed the hold: %+v -> %+v", held, got)
+	}
+	// The operator, holding the provider's invoice, settles the real cost.
+	if _, err := m.ResolveUnknownReconciled(id, res.ActualCost); err != nil {
+		t.Fatal(err)
+	}
+	final := exposure(t, m, tn)
+	if final.Reserved != 0 || final.Settled != res.ActualCost {
+		t.Fatalf("final exposure %+v, want settled %v", final, res.ActualCost)
+	}
+	assertConserved(t, final)
+	if v := audit(t, db, tn); len(v) != 0 {
+		t.Fatalf("audit: %v", v)
+	}
+}
