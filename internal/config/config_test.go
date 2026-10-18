@@ -37,3 +37,38 @@ func TestValidate_PostgresRequiresOperatorToken(t *testing.T) {
 		t.Fatal("expected postgres mode without an operator token to be rejected")
 	}
 }
+
+func TestValidate_UpstreamRequiresPostgres(t *testing.T) {
+	c := Config{
+		Addr:        ":8080",
+		StoreMode:   StoreModeMemory,
+		UpstreamURL: "https://api.example.com",
+	}
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected upstream with memory store to be rejected")
+	}
+}
+
+func TestValidate_UpstreamAllowsPostgres(t *testing.T) {
+	c := Config{
+		Addr:          ":8080",
+		StoreMode:     StoreModePostgres,
+		PostgresDSN:   "postgres://example",
+		OperatorToken: "01234567890123456789012345678901",
+		UpstreamURL:   "https://api.example.com",
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("expected postgres upstream config to validate: %v", err)
+	}
+}
+
+func TestValidate_WhitespaceUpstreamTreatedAsEmpty(t *testing.T) {
+	c := Config{
+		Addr:        ":8080",
+		StoreMode:   StoreModeMemory,
+		UpstreamURL: "   ",
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("whitespace-only upstream must not trip the guard: %v", err)
+	}
+}

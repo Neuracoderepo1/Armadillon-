@@ -131,6 +131,14 @@ func (c Config) Validate() error {
 	if c.Addr == "" {
 		return fmt.Errorf("VG_ADDR must not be empty")
 	}
+	// An upstream proxy moves real traffic, so its reservation state must
+	// survive restarts. Refuse to start with a non-durable (in-memory) store.
+	if strings.TrimSpace(c.UpstreamURL) != "" &&
+		c.StoreMode != StoreModePostgres {
+		return fmt.Errorf(
+			"VG_UPSTREAM_URL requires VG_STORE_MODE=postgres",
+		)
+	}
 	switch c.StoreMode {
 	case StoreModeMemory:
 		// no further requirements
