@@ -355,6 +355,26 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	result := s.GW.HandleRequest(ctx, requestID, tenant, s.Route,
 		provider.ExecRequest{Method: r.Method, Path: upstreamPath, Headers: fwdHeaders, Body: body}, 100, 100, 1)
 
+	// Once the provider has executed, return its actual HTTP response rather than
+	// replacing it with a gateway-only JSON envelope. This also avoids encouraging
+	// a blind client retry when settlement is still pending after an upstream call.
+	if result.Executed {
+		if result.Response.StatusCode < 200 || result.Response.StatusCode > 599 {
+			http.Error(w, "invalid upstream response status", http.StatusBadGateway)
+			return
+		}
+		copyUpstreamResponseHeaders(w.Header(), result.Response.Headers)
+		w.Header().Set("X-VelocityGuard-Request-ID", result.RequestID)
+		settlement := "settled"
+		if result.Err != nil {
+			settlement = "pending"
+		}
+		w.Header().Set("X-VelocityGuard-Settlement", settlement)
+		w.WriteHeader(result.Response.StatusCode)
+		_, _ = w.Write(result.Response.Body)
+		return
+	}
+
 	status := http.StatusOK
 	switch result.Decision.Action {
 	case risk.ActionBlock, risk.ActionKillSwitch:
@@ -377,4 +397,28 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		"actual_cost":    result.ActualCost.Float(),
 		"executed":       result.Executed,
 	})
+}
+
+// copyUpstreamResponseHeaders forwards end-to-end provider headers while removing
+// hop-by-hop headers, headers nominated by Connection, and gateway-owned metadata.
+func copyUpstreamResponseHeaders(dst, src http.Header) {
+	if src == nil {
+		return
+	}
+	filtered := provider.FilterHopByHopHeaders(src)
+	for _, connection := range src.Values("Connection") {
+		for _, token := range strings.Split(connection, ",") {
+			filtered.Del(strings.TrimSpace(token))
+		}
+	}
+	filtered.Del("Trailer")
+	filtered.Del("Content-Length") // net/http computes the length from the buffered body
+	for name, values := range filtered {
+		if strings.HasPrefix(strings.ToLower(name), "x-velocityguard-") {
+			continue
+		}
+		for _, value := range values {
+			dst.Add(name, value)
+		}
+	}
 }
