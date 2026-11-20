@@ -164,7 +164,15 @@ The following items remain unimplemented or incomplete:
 
 - Provider-specific usage parsers, versioned pricing, and provider-cost reconciliation
 - Durable HTTP request idempotency, including concurrent duplicates and replay after restart
-- Transparent upstream status/body forwarding with safe response-## CI / Verification
+- Transparent upstream status/body forwarding with safe response-header filtering
+- Shared multi-replica risk state, kill switch, circuit breaker, and rate limiting
+- Durable, tamper-evident financial event and operator-resolution audit storage
+- Admin API for tenant, key, and budget provisioning
+- Multi-period budget enforcement and period rollover
+- Webhooks for budget alerts, operator tooling, and dashboard
+- Live provider validation only after the P0 controls are complete
+
+## CI / Verification
 
 The GitHub Actions workflow runs on pushes to `main` and pull requests targeting `main`:
 
@@ -175,4 +183,3 @@ The GitHub Actions workflow runs on pushes to `main` and pull requests targeting
 | **scan** | Current stable Go toolchain, staticcheck, and govulncheck |
 
 A passing CI run verifies the code and tests on that commit. It does not by itself establish provider-invoice reconciliation, production deployment, multi-replica risk-state safety, or certification of the real-upstream path.
-
