@@ -154,7 +154,7 @@ These limitations are present in the current source and block production certifi
 6. **In-process rate limiting** — IP and tenant rate limits are scoped to one gateway process and are not multi-replica safe. The trusted-proxy boundary for forwarded client IPs also needs explicit hardening.
 7. **No admin API** — tenant, API-key, and budget provisioning currently requires out-of-band administration.
 8. **Legacy unscoped-key compatibility** — the compatibility path remains in the codebase and is being phased out.
-9. **Single-period budget behavior** — the schema supports multiple periods, but the current reservation manager uses one flat daily account and does not implement independent hourly/daily/monthly rollover.
+9. **One period per gateway manager instance** — `PGManager` supports hourly, daily, or monthly accounts and defaults to monthly; `cmd/gateway` currently constructs one default manager, so the gateway enforces the monthly account only. Simultaneous hourly/daily/monthly enforcement is not wired at the gateway entry point.
 
 Track the P0 closure criteria in [issue #11](https://github.com/Neuracoderepo1/Armadillon-/issues/11). No real upstream production traffic should be enabled while those P0 items remain open.
 
