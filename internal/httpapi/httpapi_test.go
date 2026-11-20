@@ -139,7 +139,6 @@ func TestExposure_TenantIsolation(t *testing.T) {
 	}
 }
 
-
 type fixedResponseProvider struct {
 	response provider.Response
 	usage    provider.Usage
