@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -254,8 +255,15 @@ func TestProxy_ForwardsRealRequestToUpstream(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("gateway response status = %d, want 200 (ALLOW)", resp.StatusCode)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("gateway response status = %d, want upstream status 201", resp.StatusCode)
+	}
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read upstream response: %v", err)
+	}
+	if string(responseBody) != "upstream-response" {
+		t.Fatalf("gateway response body = %q, want exact upstream body", responseBody)
 	}
 	if gotMethod != http.MethodPost {
 		t.Errorf("upstream got method %q, want POST", gotMethod)
