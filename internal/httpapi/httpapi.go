@@ -399,7 +399,6 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-
 // copyUpstreamResponseHeaders forwards end-to-end provider headers while removing
 // hop-by-hop headers, headers nominated by Connection, and gateway-owned metadata.
 func copyUpstreamResponseHeaders(dst, src http.Header) {
