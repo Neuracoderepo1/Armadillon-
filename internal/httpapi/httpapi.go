@@ -375,6 +375,25 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// An error after dispatch is not proof that the provider did not execute.
+	// Never serialize Executed=false for this case: clients must treat the
+	// reservation as UNKNOWN and must not blindly retry the request.
+	if result.DispatchOutcome == gateway.DispatchOutcomeUnknownAfterDispatch {
+		w.Header().Set("X-VelocityGuard-Request-ID", result.RequestID)
+		w.Header().Set("X-VelocityGuard-Settlement", "unknown")
+		w.Header().Set("X-VelocityGuard-Dispatch-Outcome", string(result.DispatchOutcome))
+		writeJSON(w, http.StatusBadGateway, map[string]interface{}{
+			"request_id":       result.RequestID,
+			"dispatch_outcome": result.DispatchOutcome,
+			"settlement":       "UNKNOWN",
+			"executed":         nil,
+			"automatic_retry":  false,
+			"retry_guidance":   "do_not_retry_automatically",
+			"message":          "The upstream may have processed this request. Reconcile the UNKNOWN reservation before retrying.",
+		})
+		return
+	}
+
 	status := http.StatusOK
 	switch result.Decision.Action {
 	case risk.ActionBlock, risk.ActionKillSwitch:
@@ -394,8 +413,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		"reason":         result.Decision.Reason,
 		"circuit_state":  result.Decision.CircuitState,
 		"estimated_cost": result.Decision.EstimatedCost.Float(),
-		"actual_cost":    result.ActualCost.Float(),
-		"executed":       result.Executed,
+		"actual_cost":      result.ActualCost.Float(),
+		"executed":         result.Executed,
+		"dispatch_outcome": result.DispatchOutcome,
 	})
 }
 
