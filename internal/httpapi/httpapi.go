@@ -414,13 +414,13 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, status, map[string]interface{}{
-		"request_id":     result.RequestID,
-		"action":         result.Decision.Action,
-		"risk_score":     result.Decision.RiskScore,
-		"risk_level":     result.Decision.RiskLevel,
-		"reason":         result.Decision.Reason,
-		"circuit_state":  result.Decision.CircuitState,
-		"estimated_cost": result.Decision.EstimatedCost.Float(),
+		"request_id":       result.RequestID,
+		"action":           result.Decision.Action,
+		"risk_score":       result.Decision.RiskScore,
+		"risk_level":       result.Decision.RiskLevel,
+		"reason":           result.Decision.Reason,
+		"circuit_state":    result.Decision.CircuitState,
+		"estimated_cost":   result.Decision.EstimatedCost.Float(),
 		"actual_cost":      result.ActualCost.Float(),
 		"executed":         result.Executed,
 		"dispatch_outcome": result.DispatchOutcome,
