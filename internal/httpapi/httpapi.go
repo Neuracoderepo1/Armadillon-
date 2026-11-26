@@ -380,16 +380,24 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// reservation as UNKNOWN and must not blindly retry the request.
 	if result.DispatchOutcome == gateway.DispatchOutcomeUnknownAfterDispatch {
 		w.Header().Set("X-VelocityGuard-Request-ID", result.RequestID)
-		w.Header().Set("X-VelocityGuard-Settlement", "unknown")
+		settlement := result.SettlementState
+		if settlement == "" {
+			settlement = "pending"
+		}
+		w.Header().Set("X-VelocityGuard-Settlement", settlement)
 		w.Header().Set("X-VelocityGuard-Dispatch-Outcome", string(result.DispatchOutcome))
+		settlementMessage := "The upstream may have processed this request. Reconcile the UNKNOWN reservation before retrying."
+		if settlement != "unknown" {
+			settlementMessage = "The upstream may have processed this request, but the UNKNOWN transition is not yet confirmed. Do not retry automatically."
+		}
 		writeJSON(w, http.StatusBadGateway, map[string]interface{}{
 			"request_id":       result.RequestID,
 			"dispatch_outcome": result.DispatchOutcome,
-			"settlement":       "UNKNOWN",
+			"settlement":       strings.ToUpper(settlement),
 			"executed":         nil,
 			"automatic_retry":  false,
 			"retry_guidance":   "do_not_retry_automatically",
-			"message":          "The upstream may have processed this request. Reconcile the UNKNOWN reservation before retrying.",
+			"message":          settlementMessage,
 		})
 		return
 	}
