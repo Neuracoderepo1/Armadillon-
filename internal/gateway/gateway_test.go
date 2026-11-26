@@ -67,6 +67,9 @@ func TestGateway_AmbiguousProviderFailure_KeepsHoldAndMarksUnknown(t *testing.T)
 	if res.DispatchOutcome != DispatchOutcomeUnknownAfterDispatch {
 		t.Fatalf("dispatch outcome=%q, want %q", res.DispatchOutcome, DispatchOutcomeUnknownAfterDispatch)
 	}
+	if res.SettlementState != "unknown" {
+		t.Fatalf("settlement state=%q, want unknown", res.SettlementState)
+	}
 	r, err := m.Get(res.Decision.ReservationID)
 	if err != nil {
 		t.Fatal(err)
@@ -123,6 +126,14 @@ type faulty struct {
 	reservation.Service
 	beforeReconcile func(id string)
 	failReconcile   bool
+	failMarkUnknown bool
+}
+
+func (f faulty) MarkUnknown(id string) error {
+	if f.failMarkUnknown {
+		return errors.New("database unavailable")
+	}
+	return f.Service.MarkUnknown(id)
 }
 
 func (f faulty) Reconcile(id string, a money.Micros) (reservation.ReconcileResult, error) {
@@ -139,6 +150,30 @@ func (f faulty) ResolveUnknownReconciled(id string, a money.Micros) (reservation
 		return reservation.ReconcileResult{}, errors.New("database unavailable")
 	}
 	return f.Service.ResolveUnknownReconciled(id, a)
+}
+
+func TestGateway_AmbiguousMarkUnknownFailureIsReportedPending(t *testing.T) {
+	m := reservation.NewManager()
+	g, l := newGW(t, faulty{Service: m, failMarkUnknown: true}, fnProvider{func(context.Context, provider.ExecRequest) (provider.Response, provider.Usage, error) {
+		return provider.Response{}, provider.Usage{}, errors.New("response body read failed after dispatch")
+	}})
+	res := call(g)
+	if res.Err == nil || res.DispatchOutcome != DispatchOutcomeUnknownAfterDispatch {
+		t.Fatalf("expected ambiguous provider failure, got %+v", res)
+	}
+	if res.SettlementState != "pending" {
+		t.Fatalf("settlement state=%q, want pending because UNKNOWN transition failed", res.SettlementState)
+	}
+	r, err := m.Get(res.Decision.ReservationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.State != reservation.StateReserved {
+		t.Fatalf("state=%s, want RESERVED while UNKNOWN transition is unavailable", r.State)
+	}
+	if hasEvent(l, ledger.ReservationUnknown) {
+		t.Fatal("ledger must not claim UNKNOWN when the transition failed")
+	}
 }
 
 var okProvider = fnProvider{func(context.Context, provider.ExecRequest) (provider.Response, provider.Usage, error) {
