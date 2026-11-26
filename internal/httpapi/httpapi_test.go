@@ -150,6 +150,95 @@ func (p *fixedResponseProvider) Execute(context.Context, provider.ExecRequest) (
 	return p.response, p.usage, nil
 }
 
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+type failingResponseBody struct{}
+
+func (failingResponseBody) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+func (failingResponseBody) Close() error             { return nil }
+
+func TestProxy_AmbiguousUpstreamBodyReadFailureReturnsUnknownNotExecutedFalse(t *testing.T) {
+	srv, keyA, _, tenantAID, _ := newTestServer(t)
+	upstreamCalls := 0
+	upstream := provider.NewGenericHTTP("demo-provider", "https://upstream.invalid", nil)
+	upstream.Client = &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		upstreamCalls++
+		return &http.Response{
+			StatusCode: http.StatusCreated,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       failingResponseBody{},
+			Request:    req,
+		}, nil
+	})}
+	srv.GW.Providers.Register(upstream)
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/proxy/x", nil)
+	req.Header.Set("Authorization", "Bearer "+keyA)
+	req.Header.Set("X-Request-ID", "client-ambiguous-123")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status=%d, want 502", resp.StatusCode)
+	}
+	if upstreamCalls != 1 {
+		t.Fatalf("upstream calls=%d, want exactly one", upstreamCalls)
+	}
+	if got := resp.Header.Get("X-VelocityGuard-Request-ID"); got != "client-ambiguous-123" {
+		t.Fatalf("request ID header=%q", got)
+	}
+	if got := resp.Header.Get("X-VelocityGuard-Settlement"); got != "unknown" {
+		t.Fatalf("settlement header=%q, want unknown", got)
+	}
+	if got := resp.Header.Get("X-VelocityGuard-Dispatch-Outcome"); got != string(gateway.DispatchOutcomeUnknownAfterDispatch) {
+		t.Fatalf("dispatch outcome header=%q", got)
+	}
+
+	var body map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["request_id"] != "client-ambiguous-123" {
+		t.Fatalf("request ID body=%v", body["request_id"])
+	}
+	if body["dispatch_outcome"] != string(gateway.DispatchOutcomeUnknownAfterDispatch) {
+		t.Fatalf("dispatch outcome body=%v", body["dispatch_outcome"])
+	}
+	if body["settlement"] != "UNKNOWN" {
+		t.Fatalf("settlement body=%v", body["settlement"])
+	}
+	if executed, ok := body["executed"]; !ok || executed != nil {
+		t.Fatalf("ambiguous outcome must not be reported as executed=false: %#v", body["executed"])
+	}
+	if body["automatic_retry"] != false || body["retry_guidance"] != "do_not_retry_automatically" {
+		t.Fatalf("unsafe retry guidance: %#v", body)
+	}
+
+	if exposure := srv.Reserv.Exposure(tenantAID); exposure.Reserved <= 0 {
+		t.Fatalf("UNKNOWN reservation hold was not retained: %+v", exposure)
+	}
+	unknownEvent := false
+	for _, event := range srv.Ledger.ForTenant(tenantAID) {
+		if event.Type == ledger.ReservationUnknown {
+			unknownEvent = true
+			break
+		}
+	}
+	if !unknownEvent {
+		t.Fatal("missing UNKNOWN transition event")
+	}
+}
+
 func TestProxy_ForwardsUpstreamStatusBodyAndSafeHeaders(t *testing.T) {
 	srv, keyA, _, _, _ := newTestServer(t)
 	upstreamBody := []byte(`{"error":"rate_limited"}`)
