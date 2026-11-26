@@ -64,6 +64,9 @@ func TestGateway_AmbiguousProviderFailure_KeepsHoldAndMarksUnknown(t *testing.T)
 	if res.Err == nil {
 		t.Fatal("expected the provider error to surface")
 	}
+	if res.DispatchOutcome != DispatchOutcomeUnknownAfterDispatch {
+		t.Fatalf("dispatch outcome=%q, want %q", res.DispatchOutcome, DispatchOutcomeUnknownAfterDispatch)
+	}
 	r, err := m.Get(res.Decision.ReservationID)
 	if err != nil {
 		t.Fatal(err)
@@ -87,6 +90,9 @@ func TestGateway_ProvenNotDispatched_ReleasesHold(t *testing.T) {
 	res := call(g)
 	if res.Err == nil {
 		t.Fatal("expected error")
+	}
+	if res.DispatchOutcome != DispatchOutcomeNotDispatched {
+		t.Fatalf("dispatch outcome=%q, want %q", res.DispatchOutcome, DispatchOutcomeNotDispatched)
 	}
 	r, _ := m.Get(res.Decision.ReservationID)
 	if r.State != reservation.StateReleased {
