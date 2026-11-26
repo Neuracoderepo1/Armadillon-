@@ -53,6 +53,7 @@ type RequestResult struct {
 	RequestID       string
 	Decision        risk.Decision
 	DispatchOutcome DispatchOutcome
+	SettlementState string
 	Executed        bool
 	Response        provider.Response
 	Usage           provider.Usage
@@ -129,6 +130,8 @@ func (g *Gateway) HandleRequest(ctx context.Context, requestID, tenantID string,
 	resp, usage, execErr := p.Execute(ctx, execReq)
 	if execErr != nil {
 		outcome := DispatchOutcomeUnknownAfterDispatch
+		settlementState := ""
+		failureMeta := map[string]string{"error": execErr.Error()}
 		if provider.IsNotDispatched(execErr) {
 			// The provider proved the request never left: safe to return the hold.
 			outcome = DispatchOutcomeNotDispatched
@@ -140,14 +143,20 @@ func (g *Gateway) HandleRequest(ctx context.Context, requestID, tenantID string,
 			// than serializing Executed=false to the client.
 			meta := map[string]string{"reason": "ambiguous provider failure; hold kept"}
 			if merr := g.Reserv.MarkUnknown(decision.ReservationID); merr != nil {
+				// Do not claim UNKNOWN unless the transition was confirmed. The
+				// RESERVED hold remains in place and TTL recovery can retry it.
 				meta["mark_unknown_error"] = merr.Error()
+				failureMeta["mark_unknown_error"] = merr.Error()
+				settlementState = "pending"
+			} else {
+				settlementState = "unknown"
+				g.Ledger.Append(ledger.Event{Type: ledger.ReservationUnknown, TenantID: tenantID, RequestID: requestID,
+					ReservationID: decision.ReservationID, Metadata: meta})
 			}
-			g.Ledger.Append(ledger.Event{Type: ledger.ReservationUnknown, TenantID: tenantID, RequestID: requestID,
-				ReservationID: decision.ReservationID, Metadata: meta})
 		}
 		g.Ledger.Append(ledger.Event{Type: ledger.RequestFailed, TenantID: tenantID, RequestID: requestID,
-			Metadata: map[string]string{"error": execErr.Error()}})
-		return RequestResult{RequestID: requestID, Decision: decision, DispatchOutcome: outcome, Err: execErr}
+			Metadata: failureMeta})
+		return RequestResult{RequestID: requestID, Decision: decision, DispatchOutcome: outcome, SettlementState: settlementState, Err: execErr}
 	}
 	g.Ledger.Append(ledger.Event{Type: ledger.RequestExecuted, TenantID: tenantID, RequestID: requestID,
 		Route: route.Route, Provider: route.Provider})
