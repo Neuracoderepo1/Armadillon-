@@ -2,7 +2,7 @@
 
 **A budget-enforcing gateway for LLM API traffic.** Per-tenant spend limits, authenticated access, and a ledger that guarantees AI costs can't run away.
 
-> Status: core engine built and tested; distributed-production hardening in progress. See [Known limitations](#known-limitations).
+> Status: the PostgreSQL reservation core has passing CI evidence. The real-upstream path is **not production-certified**: GenericHTTP reports synthetic usage, HTTP idempotency is not durable, and response forwarding is implemented only on the open, unmerged PR #13 candidate. Its ambiguous post-dispatch path reports UNKNOWN and advises against automatic retry, but duplicate-dispatch prevention is not established. See [Known limitations](#known-limitations) and [P0 issue #11](https://github.com/Neuracoderepo1/Armadillon-/issues/11).
 
 ## The problem
 
@@ -10,12 +10,14 @@ Teams put paid LLM APIs behind their products and discover the bill after the fa
 
 ## What it does
 
-Armadillon is a **Go budget-enforcement / cost-control gateway** for LLM API traffic. It sits between client applications and downstream model providers, enforcing per-tenant spend limits by intercepting every request, reserving estimated cost against a tenant's budget, forwarding the request, and then settling against the actual provider charge.
+Armadillon is a **Go budget-enforcement / cost-control gateway** for LLM API traffic. It sits between client applications and downstream model providers, reserves an estimated amount against a tenant's budget, forwards the request, and settles using the usage returned by the selected provider adapter. Settlement accuracy depends on that adapter: the currently wired GenericHTTP adapter does not parse provider usage and returns placeholder units. The real-upstream path therefore does not currently reconcile actual provider charges and remains blocked from production traffic.
 
-**Key guarantees:**
-- Reserved + settled spend never exceeds the tenant's budget, including under concurrent load.
-- A 150-concurrent-request test verifies this invariant.
-- In the Postgres-backed mode (`cmd/gateway`), budget holds are durable across gateway restarts and include a reconciliation loop for requests that outlive their time-to-live.
+**Verified reservation properties:**
+- PostgreSQL reservation writes serialize on the tenant budget row, preventing concurrent reservations from overcommitting the configured estimate.
+- The reservation test suite exercises concurrent requests, fault injection, ambiguous outcomes, and recovery.
+- In PostgreSQL mode, reservation state is durable across restarts and a startup/background maintenance worker expires stale holds and retries recovery.
+
+These guarantees do **not** establish actual provider-billing reconciliation, durable HTTP idempotency, or multi-replica risk-control state. A provider charge can differ from the estimate; see [P0 issue #11](https://github.com/Neuracoderepo1/Armadillon-/issues/11).
 
 ## Request flow
 
@@ -24,7 +26,7 @@ Every request follows a **reserve-then-settle** pattern:
 1. **Authenticate** — A Bearer API key is presented. The key is stored only as a SHA-256 hash; tenant identity is derived from the key, never from client-supplied headers or query parameters.
 2. **Reserve** — The risk engine estimates the cost using the pricing registry and reserves that amount against the tenant's budget.
 3. **Forward** — The request is sent to the downstream provider through a provider abstraction, behind a circuit breaker.
-4. **Settle** — The actual cost from the provider is written to the ledger, and the reservation is released or adjusted.
+4. **Settle** — The gateway calculates a settlement amount from the usage returned by the provider adapter and reconciles the reservation. This is only as trustworthy as the adapter's usage data. GenericHTTP currently returns synthetic usage, so this is not actual provider-invoice reconciliation.
 
 **Handling ambiguous failures:** If a provider call times out or is reset mid-response, the gateway cannot prove the request was *not* dispatched. In those cases the gateway keeps the budget hold (marking the settlement as `UNKNOWN`) rather than prematurely releasing it, preventing budget from being spent twice. A reconciliation loop later resolves these pending entries.
 
@@ -33,32 +35,33 @@ Every request follows a **reserve-then-settle** pattern:
 Armadillon supports two persistence back-ends for its control plane:
 
 - **In-memory** — Suitable for single-replica development and testing.
-- **PostgreSQL** — For production deployments. SQL migrations are in the `migrations/` directory. The gateway runs a startup recovery pass and a background maintenance loop (expiry + recovery of stale reservations and unknown settlements). In this mode the `/readyz` endpoint returns 503 until startup recovery succeeds and the ledger is fully healthy; `/health` remains unchanged.
+- **PostgreSQL** — The durable reservation-storage path. SQL migrations are in `migrations/`. The gateway runs startup recovery and a background maintenance loop for stale reservations and unknown settlements. `/readyz` remains 503 until startup recovery succeeds. This is necessary but not sufficient for production certification: the separate event ledger and risk-engine state are still process-local, and the P0 upstream-accounting/idempotency gaps remain open.
 
 Tests that require a live database skip gracefully unless the `VG_TEST_POSTGRES_DSN` environment variable is set.
 
-## Supported providers
+## Runtime provider wiring
 
-Providers are configured via the config file (`config.yaml` by default). The gateway's `main.go` (`cmd/gateway/main.go`) wires up the following provider packages from the codebase:
+The actual entry point is `cmd/gateway/main.go`. It registers only these runtime providers:
 
-| Provider | Package |
+| Runtime provider | Selection condition |
 |---|---|
-| OpenAI | `internal/provider/openai` |
-| Google (Gemini) | `internal/provider/google` |
-| Unstructured | `internal/provider/unstructured` |
+| `GenericHTTP` | `VG_UPSTREAM_URL` is set; the configured destination host is allowlisted |
+| `MockProvider` | `VG_UPSTREAM_URL` is not set; demo/test mode |
 
-These are the only provider packages present in the source tree; additional providers can be added by implementing the `provider.Service` interface in `internal/provider/provider.go`.
+Provider package names or directories are not proof that a provider is registered in the running gateway. The OpenAI, Google, and Unstructured entries in older documentation are not runtime targets wired by the current `cmd/gateway/main.go`.
 
-> **Important distinction:** The cost estimates used by the risk engine are **predictions** derived from the pricing registry. They are **not** the same as the provider's final invoice or actual usage charges. The settle phase captures the real cost, but there can be variance between the estimate and what the provider bills.
+GenericHTTP currently returns placeholder usage (`InputUnits: 1`, `OutputUnits: 0`) rather than parsing provider-reported token or billing usage. Do not treat its settlement as an actual provider charge. Real upstream traffic remains blocked pending provider-specific usage parsing, versioned pricing, durable request idempotency, and independent acceptance/merge of the PR #13 response-forwarding candidate (see [P0 issue #11](https://github.com/Neuracoderepo1/Armadillon-/issues/11)).
+
+> **Estimate versus actual:** the risk engine's pre-call estimate is a prediction from the pricing registry. The current HTTP handler supplies fixed estimate units (100 input, 100 output); GenericHTTP's post-call usage is synthetic. Consequently, the current `actual_cost` field is a calculation from placeholder usage, not a provider invoice or independently verified charge.
 
 ## Components
 
 | Component | Role |
 |---|---|
 | Risk engine | Fast allow/deny decisions on every request |
-| Reservation manager | Holds budget for in-flight requests |
-| Circuit breaker | Stops traffic to failing providers |
-| Ledger | Append-only record of spend |
+| Reservation manager | In-memory or PostgreSQL-backed reservation state, depending on store mode |
+| Circuit breaker | Process-local breaker state; not coordinated across replicas |
+| Ledger | In-memory event log; not a durable financial audit store |
 | Pricing registry | Per-model cost estimates |
 | Provider abstraction | One interface across model providers |
 | Control plane (Postgres) | Tenants, API keys, budget accounts |
@@ -67,7 +70,7 @@ These are the only provider packages present in the source tree; additional prov
 
 - **Language:** Go
 - **Control plane:** PostgreSQL with SQL migrations
-- **Configuration:** `config.yaml` (path configurable via `--config` flag), env-based config with fail-fast validation
+- **Configuration:** environment variables loaded by `internal/config`; no `config.yaml` or `--config` support
 - **HTTP server:** Standard Go `net/http`, listens on a configurable address
 - **CLI:** `cmd/gateway` — the main entry point
 
@@ -87,15 +90,30 @@ go vet ./...
 
 ### Running the gateway
 
-```bash
-# Use the default config.yaml (placed in the working directory)
-./gateway
+`cmd/gateway` reads environment variables only. It does **not** read `config.yaml` and does **not** support a `--config` flag.
 
-# Or specify a custom config path
-./gateway --config /path/to/config.yaml
+Important variables:
+
+| Variable | Purpose |
+|---|---|
+| `VG_ADDR` | HTTP listen address; defaults to `:8080` |
+| `VG_STORE_MODE` | `memory` (default) or `postgres` |
+| `VG_POSTGRES_DSN` | Required when `VG_STORE_MODE=postgres` |
+| `VG_OPERATOR_TOKEN` | Required in PostgreSQL mode; minimum 32 characters |
+| `VG_UPSTREAM_URL` | Optional single upstream destination; requires PostgreSQL mode and selects GenericHTTP |
+| `VG_RATE_LIMIT_IP_RPS`, `VG_RATE_LIMIT_IP_BURST` | Per-process IP rate limits |
+| `VG_RATE_LIMIT_TENANT_RPS`, `VG_RATE_LIMIT_TENANT_BURST` | Per-process tenant rate limits |
+| `VG_SHUTDOWN_TIMEOUT` | Graceful shutdown duration, e.g. `15s` |
+
+For a local mock/demo run:
+
+```bash
+VG_STORE_MODE=memory go run ./cmd/gateway
 ```
 
-The gateway requires at least one provider to be enabled in the configuration file. Configuration sections are available for OpenAI, Google, and Unstructured providers, each with `Enabled`, `Name`, and provider-specific fields.
+For PostgreSQL-backed reservation storage, provide `VG_POSTGRES_DSN` and a strong `VG_OPERATOR_TOKEN`. PostgreSQL mode skips demo-tenant creation; tenants, keys, and budgets must currently be provisioned out of band because no admin API exists.
+
+Setting `VG_UPSTREAM_URL` switches from MockProvider to GenericHTTP. **Do not enable real upstream production traffic until P0 issue #11 is closed and independently certified.** The current GenericHTTP usage is synthetic and the HTTP request path is not durably idempotent.
 
 ### Running tests
 
@@ -126,32 +144,42 @@ These tests cover concurrency scenarios, crash/restart recovery, ambiguous failu
 
 ## Known limitations
 
-These are limitations **currently present in the code**, verified from the source:
+These limitations are present in the current source and block production certification of the real-upstream path:
 
-1. **In-process (non-distributed) rate limiting** — Rate limiting is scoped to a single gateway process. It is not safe across multiple replicas. *Roadmap item: distributed rate limiting for multi-replica deployments.*
-2. **No admin API** — There is currently no admin API for provisioning tenants, keys, and budgets. *Roadmap item: admin API.*
-3. **Legacy unscoped-key compatibility** — Legacy unscoped-key compatibility still exists in the codebase and is being phased out.
-4. **Estimate-vs-provider-billing variance** — The risk engine uses cost *estimates* from the pricing registry. These estimates may differ from the provider's actual invoice or final usage charges.
-5. **In-flight request handling** — When a provider call is ambiguous (timed out or reset mid-response), the gateway conservatively keeps the budget hold rather than releasing it. This protects against overspend but may temporarily tie up budget until reconciliation resolves the entry.
+1. **Synthetic provider usage (P0)** — `internal/provider/provider.go` returns `Usage{InputUnits: 1, OutputUnits: 0}` for GenericHTTP. It does not parse provider-reported usage or invoice data. The demo pricing registry is not a production provider price book.
+2. **No durable HTTP idempotency (P0)** — `X-Request-ID` is used for correlation and forwarded upstream, but the HTTP request path does not use it as a durable idempotency key. The PostgreSQL reservation manager's keyed capability is not wired into this request path.
+3. **Response forwarding is candidate-only (P0.3 partially addressed)** — open PR #13 forwards upstream status/body and filters hop-by-hop, Connection-nominated, and gateway-owned headers. Its exact-head CI and HTTP regressions pass, but the change is unmerged and not production-certified. The ambiguous post-dispatch response-read failure path now reports UNKNOWN and disables automatic retry; it does not establish duplicate-dispatch prevention, which remains blocked by P0.2 durable idempotency.
+4. **Process-local risk state** — kill-switch flags, velocity tracking, and circuit-breaker state live in the gateway process. Independent replicas do not share these controls.
+5. **In-memory event ledger** — the event log, including operator-resolution evidence, is process-local. Durable reservation rows do not make this a durable, tamper-evident audit ledger.
+6. **In-process rate limiting** — IP and tenant rate limits are scoped to one gateway process and are not multi-replica safe. The trusted-proxy boundary for forwarded client IPs also needs explicit hardening.
+7. **No admin API** — tenant, API-key, and budget provisioning currently requires out-of-band administration.
+8. **Legacy unscoped-key compatibility** — the compatibility path remains in the codebase and is being phased out.
+9. **One period per gateway manager instance** — `PGManager` supports hourly, daily, or monthly accounts and defaults to monthly; `cmd/gateway` currently constructs one default manager, so the gateway enforces the monthly account only. Simultaneous hourly/daily/monthly enforcement is not wired at the gateway entry point.
+
+Track the P0 closure criteria in [issue #11](https://github.com/Neuracoderepo1/Armadillon-/issues/11). No real upstream production traffic should be enabled while those P0 items remain open.
 
 ## Roadmap
 
-The following items are on the public roadmap but **not yet implemented**:
+The following items remain unimplemented or incomplete:
 
-- Distributed rate limiting for multi-replica deployments
+- Provider-specific usage parsers, versioned pricing, and provider-cost reconciliation
+- Durable HTTP request idempotency, including concurrent duplicates and replay after restart
+- Merge and independently certify the PR #13 response-forwarding candidate; complete durable idempotency before enabling retries or real upstream traffic
+- Shared multi-replica risk state, kill switch, circuit breaker, and rate limiting
+- Durable, tamper-evident financial event and operator-resolution audit storage
 - Admin API for tenant, key, and budget provisioning
-- Webhooks for budget alerts
-- CLI tool
-- React/TypeScript dashboard
-- Live validation against Claude API traffic
+- Multi-period budget enforcement and period rollover
+- Webhooks for budget alerts, operator tooling, and dashboard
+- Live provider validation only after the P0 controls are complete
 
 ## CI / Verification
 
-The GitHub Actions CI (`.github/workflows/ci.yml`) runs on every push to `main` and every pull request against `main`:
+The GitHub Actions workflow runs on pushes to `main` and pull requests targeting `main`:
 
 | Job | Description |
 |---|---|
-| **Lint** | `go vet ./...` with Go 1.22 |
-| **Test** | `go test -v ./...` with Go 1.22 |
-| **Test Stable** | `go test -v ./...` with Go 1.21 |
-| **Scan** | `govulncheck ./...` — checks for known Go vulnerabilities |
+| **test** | Go 1.22, PostgreSQL 16, migrations, gofmt, vet, build, test compilation, race tests, reservation-ledger race suite (10 repetitions), and fault-injection race suite (10 repetitions) |
+| **test-stable** | Current stable Go toolchain, PostgreSQL 16, migrations, vet, and race tests |
+| **scan** | Current stable Go toolchain, staticcheck, and govulncheck |
+
+A passing CI run verifies the code and tests on that commit. It does not by itself establish provider-invoice reconciliation, production deployment, multi-replica risk-state safety, or certification of the real-upstream path.

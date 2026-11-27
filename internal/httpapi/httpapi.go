@@ -355,6 +355,53 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	result := s.GW.HandleRequest(ctx, requestID, tenant, s.Route,
 		provider.ExecRequest{Method: r.Method, Path: upstreamPath, Headers: fwdHeaders, Body: body}, 100, 100, 1)
 
+	// Once the provider has executed, return its actual HTTP response rather than
+	// replacing it with a gateway-only JSON envelope. This also avoids encouraging
+	// a blind client retry when settlement is still pending after an upstream call.
+	if result.Executed {
+		if result.Response.StatusCode < 200 || result.Response.StatusCode > 599 {
+			http.Error(w, "invalid upstream response status", http.StatusBadGateway)
+			return
+		}
+		copyUpstreamResponseHeaders(w.Header(), result.Response.Headers)
+		w.Header().Set("X-VelocityGuard-Request-ID", result.RequestID)
+		settlement := "settled"
+		if result.Err != nil {
+			settlement = "pending"
+		}
+		w.Header().Set("X-VelocityGuard-Settlement", settlement)
+		w.WriteHeader(result.Response.StatusCode)
+		_, _ = w.Write(result.Response.Body)
+		return
+	}
+
+	// An error after dispatch is not proof that the provider did not execute.
+	// Never serialize Executed=false for this case: clients must treat the
+	// reservation as UNKNOWN and must not blindly retry the request.
+	if result.DispatchOutcome == gateway.DispatchOutcomeUnknownAfterDispatch {
+		w.Header().Set("X-VelocityGuard-Request-ID", result.RequestID)
+		settlement := result.SettlementState
+		if settlement == "" {
+			settlement = "pending"
+		}
+		w.Header().Set("X-VelocityGuard-Settlement", settlement)
+		w.Header().Set("X-VelocityGuard-Dispatch-Outcome", string(result.DispatchOutcome))
+		settlementMessage := "The upstream may have processed this request. Reconcile the UNKNOWN reservation before retrying."
+		if settlement != "unknown" {
+			settlementMessage = "The upstream may have processed this request, but the UNKNOWN transition is not yet confirmed. Do not retry automatically."
+		}
+		writeJSON(w, http.StatusBadGateway, map[string]interface{}{
+			"request_id":       result.RequestID,
+			"dispatch_outcome": result.DispatchOutcome,
+			"settlement":       strings.ToUpper(settlement),
+			"executed":         nil,
+			"automatic_retry":  false,
+			"retry_guidance":   "do_not_retry_automatically",
+			"message":          settlementMessage,
+		})
+		return
+	}
+
 	status := http.StatusOK
 	switch result.Decision.Action {
 	case risk.ActionBlock, risk.ActionKillSwitch:
@@ -367,14 +414,39 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, status, map[string]interface{}{
-		"request_id":     result.RequestID,
-		"action":         result.Decision.Action,
-		"risk_score":     result.Decision.RiskScore,
-		"risk_level":     result.Decision.RiskLevel,
-		"reason":         result.Decision.Reason,
-		"circuit_state":  result.Decision.CircuitState,
-		"estimated_cost": result.Decision.EstimatedCost.Float(),
-		"actual_cost":    result.ActualCost.Float(),
-		"executed":       result.Executed,
+		"request_id":       result.RequestID,
+		"action":           result.Decision.Action,
+		"risk_score":       result.Decision.RiskScore,
+		"risk_level":       result.Decision.RiskLevel,
+		"reason":           result.Decision.Reason,
+		"circuit_state":    result.Decision.CircuitState,
+		"estimated_cost":   result.Decision.EstimatedCost.Float(),
+		"actual_cost":      result.ActualCost.Float(),
+		"executed":         result.Executed,
+		"dispatch_outcome": result.DispatchOutcome,
 	})
+}
+
+// copyUpstreamResponseHeaders forwards end-to-end provider headers while removing
+// hop-by-hop headers, headers nominated by Connection, and gateway-owned metadata.
+func copyUpstreamResponseHeaders(dst, src http.Header) {
+	if src == nil {
+		return
+	}
+	filtered := provider.FilterHopByHopHeaders(src)
+	for _, connection := range src.Values("Connection") {
+		for _, token := range strings.Split(connection, ",") {
+			filtered.Del(strings.TrimSpace(token))
+		}
+	}
+	filtered.Del("Trailer")
+	filtered.Del("Content-Length") // net/http computes the length from the buffered body
+	for name, values := range filtered {
+		if strings.HasPrefix(strings.ToLower(name), "x-velocityguard-") {
+			continue
+		}
+		for _, value := range values {
+			dst.Add(name, value)
+		}
+	}
 }

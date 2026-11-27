@@ -35,15 +35,31 @@ func New(riskEngine *risk.Engine, reserv reservation.Service, pr *pricing.Regist
 	return &Gateway{Risk: riskEngine, Reserv: reserv, Pricing: pr, Providers: providers, Ledger: l}
 }
 
+type DispatchOutcome string
+
+const (
+	// DispatchOutcomeNotDispatched means the provider was not called or proved
+	// that no request reached the upstream.
+	DispatchOutcomeNotDispatched DispatchOutcome = "not_dispatched"
+	// DispatchOutcomeUnknownAfterDispatch means the request may have reached
+	// and been processed by the upstream, but no complete response was obtained.
+	DispatchOutcomeUnknownAfterDispatch DispatchOutcome = "unknown_after_dispatch"
+	// DispatchOutcomeExecuted means an upstream response was received and usage
+	// was available for settlement (settlement itself may still be pending).
+	DispatchOutcomeExecuted DispatchOutcome = "executed"
+)
+
 type RequestResult struct {
-	RequestID  string
-	Decision   risk.Decision
-	Executed   bool
-	Response   provider.Response
-	Usage      provider.Usage
-	ActualCost money.Micros
-	Reconcile  reservation.ReconcileResult
-	Err        error
+	RequestID       string
+	Decision        risk.Decision
+	DispatchOutcome DispatchOutcome
+	SettlementState string
+	Executed        bool
+	Response        provider.Response
+	Usage           provider.Usage
+	ActualCost      money.Micros
+	Reconcile       reservation.ReconcileResult
+	Err             error
 }
 
 // HandleRequest runs one request through the full pipeline. estimatedUnits
@@ -57,7 +73,7 @@ func (g *Gateway) HandleRequest(ctx context.Context, requestID, tenantID string,
 	if err != nil {
 		g.Ledger.Append(ledger.Event{Type: ledger.RequestFailed, TenantID: tenantID, RequestID: requestID, Route: route.Route,
 			Metadata: map[string]string{"error": err.Error()}})
-		return RequestResult{RequestID: requestID, Err: fmt.Errorf("pricing lookup failed: %w", err)}
+		return RequestResult{RequestID: requestID, DispatchOutcome: DispatchOutcomeNotDispatched, Err: fmt.Errorf("pricing lookup failed: %w", err)}
 	}
 	estimatedCost := rate.Estimate(estimatedInputUnits, estimatedOutputUnits)
 
@@ -94,13 +110,13 @@ func (g *Gateway) HandleRequest(ctx context.Context, requestID, tenantID string,
 		// risk.Engine THROTTLE case and TestFinalAcceptanceScenario). The
 		// hold is never returned automatically; it ends as UNKNOWN after its
 		// TTL. Whether to release it instead is a product decision.
-		return RequestResult{RequestID: requestID, Decision: decision}
+		return RequestResult{RequestID: requestID, Decision: decision, DispatchOutcome: DispatchOutcomeNotDispatched}
 
 	default: // BLOCK, KILL_SWITCH
 		g.Ledger.Append(ledger.Event{Type: ledger.RequestBlocked, TenantID: tenantID, RequestID: requestID,
 			Route: route.Route, Provider: route.Provider,
 			Metadata: map[string]string{"reason": decision.Reason, "rule": decision.RuleTriggered}})
-		return RequestResult{RequestID: requestID, Decision: decision}
+		return RequestResult{RequestID: requestID, Decision: decision, DispatchOutcome: DispatchOutcomeNotDispatched}
 	}
 
 	// --- Execute ---
@@ -108,30 +124,39 @@ func (g *Gateway) HandleRequest(ctx context.Context, requestID, tenantID string,
 	if err != nil {
 		// Nothing was sent: proven non-dispatch.
 		g.releaseNotDispatched(tenantID, requestID, decision.ReservationID, "provider not found")
-		return RequestResult{RequestID: requestID, Decision: decision, Err: err}
+		return RequestResult{RequestID: requestID, Decision: decision, DispatchOutcome: DispatchOutcomeNotDispatched, Err: err}
 	}
 
 	resp, usage, execErr := p.Execute(ctx, execReq)
 	if execErr != nil {
+		outcome := DispatchOutcomeUnknownAfterDispatch
+		settlementState := ""
+		failureMeta := map[string]string{"error": execErr.Error()}
 		if provider.IsNotDispatched(execErr) {
 			// The provider proved the request never left: safe to return the hold.
+			outcome = DispatchOutcomeNotDispatched
 			g.releaseNotDispatched(tenantID, requestID, decision.ReservationID, "not dispatched: "+execErr.Error())
 		} else {
-			// AMBIGUOUS: a timeout, reset or cancellation after dispatch does not
-			// tell us whether the upstream executed (and billed) the call. The
-			// hold must NOT be returned; flag it UNKNOWN for recovery. If even
-			// that write fails the reservation simply stays RESERVED and TTL
-			// expiry moves it to UNKNOWN. Release is never the fallback.
+			// AMBIGUOUS: a timeout, reset, cancellation or response-body read
+			// failure after dispatch does not prove that the upstream did not
+			// process (and bill) the call. Keep the hold and expose UNKNOWN rather
+			// than serializing Executed=false to the client.
 			meta := map[string]string{"reason": "ambiguous provider failure; hold kept"}
 			if merr := g.Reserv.MarkUnknown(decision.ReservationID); merr != nil {
+				// Do not claim UNKNOWN unless the transition was confirmed. The
+				// RESERVED hold remains in place and TTL recovery can retry it.
 				meta["mark_unknown_error"] = merr.Error()
+				failureMeta["mark_unknown_error"] = merr.Error()
+				settlementState = "pending"
+			} else {
+				settlementState = "unknown"
+				g.Ledger.Append(ledger.Event{Type: ledger.ReservationUnknown, TenantID: tenantID, RequestID: requestID,
+					ReservationID: decision.ReservationID, Metadata: meta})
 			}
-			g.Ledger.Append(ledger.Event{Type: ledger.ReservationUnknown, TenantID: tenantID, RequestID: requestID,
-				ReservationID: decision.ReservationID, Metadata: meta})
 		}
 		g.Ledger.Append(ledger.Event{Type: ledger.RequestFailed, TenantID: tenantID, RequestID: requestID,
-			Metadata: map[string]string{"error": execErr.Error()}})
-		return RequestResult{RequestID: requestID, Decision: decision, Err: execErr}
+			Metadata: failureMeta})
+		return RequestResult{RequestID: requestID, Decision: decision, DispatchOutcome: outcome, SettlementState: settlementState, Err: execErr}
 	}
 	g.Ledger.Append(ledger.Event{Type: ledger.RequestExecuted, TenantID: tenantID, RequestID: requestID,
 		Route: route.Route, Provider: route.Provider})
@@ -162,7 +187,7 @@ func (g *Gateway) HandleRequest(ctx context.Context, requestID, tenantID string,
 		// velocity tracker honest. The durable pending actual (if it was
 		// recorded) lets recovery finish the settlement.
 		g.Risk.RecordUsage(tenantID, actualCost)
-		return RequestResult{RequestID: requestID, Decision: decision, Executed: true, Response: resp, Usage: usage, ActualCost: actualCost, Err: err}
+		return RequestResult{RequestID: requestID, Decision: decision, DispatchOutcome: DispatchOutcomeExecuted, Executed: true, Response: resp, Usage: usage, ActualCost: actualCost, Err: err}
 	}
 	g.Ledger.Append(ledger.Event{Type: ledger.CostReconciled, TenantID: tenantID, RequestID: requestID,
 		ReservationID: decision.ReservationID, Amount: actualCost,
@@ -173,7 +198,7 @@ func (g *Gateway) HandleRequest(ctx context.Context, requestID, tenantID string,
 	g.Risk.RecordUsage(tenantID, actualCost)
 
 	return RequestResult{
-		RequestID: requestID, Decision: decision, Executed: true,
+		RequestID: requestID, Decision: decision, DispatchOutcome: DispatchOutcomeExecuted, Executed: true,
 		Response: resp, Usage: usage, ActualCost: actualCost, Reconcile: recResult,
 	}
 }
